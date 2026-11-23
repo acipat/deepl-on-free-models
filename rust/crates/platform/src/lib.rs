@@ -5,6 +5,7 @@
 //! * [`selection`] — capture the text selected in the foreground application.
 //! * [`hotkeys`] — system-wide shortcuts.
 //! * [`speech`] — text to speech.
+//! * [`startup`] — "Open at login" (launch at sign-in).
 //!
 //! Everything compiles on Linux; unsupported features return `false`/`None`
 //! and log once instead of failing.  The real implementations live behind
@@ -17,3 +18,4 @@ pub mod markdown;
 pub mod pasteboard;
 pub mod selection;
 pub mod speech;
+pub mod startup;
