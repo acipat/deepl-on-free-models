@@ -50,6 +50,8 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 const CANCEL_POLL: Duration = Duration::from_millis(40);
 /// Pause before a lowered-temperature retry (Python: 0.120 s).
 const RETRY_DELAY: Duration = Duration::from_millis(120);
+/// Largest streamed line accepted before the response is declared broken.
+const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 /// Blocks up to this many characters use the heading instruction.
 const SHORT_BLOCK_LIMIT: usize = 80;
 /// Byte cap for one `rewrite` response.
@@ -113,23 +115,56 @@ impl Translator {
                     Some(fallback) if job.degenerate => {
                         log::info!("no block translated; retrying on the fallback backend");
                         emit_partial(&request.on_partial, "");
-                        (self.run_job(&request, fallback).await?, true)
+                        match self.run_job(&request, fallback).await {
+                            Ok(fallback_job) => (fallback_job, true),
+                            Err(failure) => {
+                                if failure.error.kind == ErrorKind::Cancelled
+                                    || is_cancelled(request.cancel.as_ref())
+                                {
+                                    return Err(TranslationError::new(ErrorKind::Cancelled));
+                                }
+                                log::warn!(
+                                    "fallback failed ({}); keeping the primary result",
+                                    failure.error
+                                );
+                                (job, false)
+                            }
+                        }
                     }
                     _ => (job, false),
                 }
             }
-            Err(error) => {
-                if error.kind == ErrorKind::Cancelled || is_cancelled(request.cancel.as_ref()) {
+            Err(failure) => {
+                if failure.error.kind == ErrorKind::Cancelled
+                    || is_cancelled(request.cancel.as_ref())
+                {
                     return Err(TranslationError::new(ErrorKind::Cancelled));
                 }
                 let Some(fallback) = distinct_fallback(&request) else {
-                    return Err(error);
+                    return Err(failure.error);
                 };
                 log::info!(
-                    "primary translation failed ({error}); retrying on the fallback backend"
+                    "primary translation failed ({}); retrying on the fallback backend",
+                    failure.error
                 );
                 emit_partial(&request.on_partial, "");
-                (self.run_job(&request, fallback).await?, true)
+                match self.run_job(&request, fallback).await {
+                    Ok(fallback_job) => (fallback_job, true),
+                    Err(fallback_failure) => {
+                        if fallback_failure.error.kind == ErrorKind::Cancelled
+                            || is_cancelled(request.cancel.as_ref())
+                        {
+                            return Err(TranslationError::new(ErrorKind::Cancelled));
+                        }
+                        // Both backends failed: keep the primary's partial work
+                        // instead of losing it to the fallback's error.
+                        log::warn!(
+                            "fallback failed ({}); keeping the primary result",
+                            fallback_failure.error
+                        );
+                        (failure.partial, false)
+                    }
+                }
             }
         };
 
@@ -189,7 +224,7 @@ impl Translator {
                 if error.kind == ErrorKind::Cancelled || is_cancelled(cancel.as_ref()) {
                     return Err(TranslationError::new(ErrorKind::Cancelled));
                 }
-                let fallback = fallback.filter(|candidate| !std::ptr::eq(*candidate, config));
+                let fallback = fallback.filter(|candidate| !same_endpoint(candidate, config));
                 let Some(fallback) = fallback else {
                     return Err(error);
                 };
@@ -271,7 +306,7 @@ impl Translator {
         &self,
         request: &TranslateRequest<'_>,
         config: &BackendConfig,
-    ) -> Result<JobResult, TranslationError> {
+    ) -> Result<JobResult, JobFailure> {
         let chunks = TextChunker::split(&TextChunker::normalize(request.text));
         if chunks.is_empty() {
             return Ok(JobResult {
@@ -289,7 +324,20 @@ impl Translator {
         let mut seconds = 0.0f64;
 
         for (index, chunk) in chunks.iter().enumerate() {
-            check_cancelled(request.cancel.as_ref())?;
+            if let Err(error) = check_cancelled(request.cancel.as_ref()) {
+                return Err(abandon_job(
+                    error,
+                    &chunks,
+                    translated,
+                    index,
+                    JobProgress {
+                        warnings,
+                        translated_count,
+                        tokens,
+                        seconds,
+                    },
+                ));
+            }
             let body = &chunk.text;
             let line = format!("{}{}", chunk.prefix, body);
             if chunk.is_code || !body.chars().any(is_letter) {
@@ -325,7 +373,20 @@ impl Translator {
                     report(&request.on_progress, index + 1, total);
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    return Err(abandon_job(
+                        error,
+                        &chunks,
+                        translated,
+                        index,
+                        JobProgress {
+                            warnings,
+                            translated_count,
+                            tokens,
+                            seconds,
+                        },
+                    ));
+                }
             };
 
             let (translated_text, warning) =
@@ -382,7 +443,7 @@ impl Translator {
         );
         let plain_fallback = PromptBuilder::plain_prompt(body, target);
         let prompts = if body.chars().count() <= SHORT_BLOCK_LIMIT {
-            vec![neutral_heading, plain_fallback]
+            unique_prompts(vec![neutral_heading, plain_fallback])
         } else {
             let styled =
                 PromptBuilder::prompt(body, request.style, request.tone, target, preserve_markdown);
@@ -400,11 +461,11 @@ impl Translator {
                 target,
                 preserve_markdown,
             );
-            match request.style {
+            unique_prompts(match request.style {
                 TranslationStyle::Auto => vec![styled, natural, plain_fallback],
                 TranslationStyle::Natural => vec![styled, plain_fallback, literal],
                 TranslationStyle::Literal => vec![styled, natural, plain_fallback],
-            }
+            })
         };
 
         self.buffered_translation(
@@ -503,7 +564,7 @@ impl Translator {
         let mut seconds = 0.0f64;
         for piece in &pieces {
             check_cancelled(request.cancel.as_ref())?;
-            let prompts = [
+            let prompts = unique_prompts(vec![
                 PromptBuilder::plain_prompt(piece, request.target.english_name),
                 PromptBuilder::prompt(
                     piece,
@@ -519,7 +580,7 @@ impl Translator {
                     request.target.english_name,
                     false,
                 ),
-            ];
+            ]);
             let mut success: Option<String> = None;
             for prompt in &prompts {
                 let retry = retry_config(config, 1);
@@ -645,6 +706,20 @@ struct JobResult {
     degenerate: bool,
 }
 
+/// A job that could not finish, together with the part that was translated.
+struct JobFailure {
+    error: TranslationError,
+    partial: JobResult,
+}
+
+/// Counters accumulated before a job was abandoned.
+struct JobProgress {
+    warnings: usize,
+    translated_count: usize,
+    tokens: u64,
+    seconds: f64,
+}
+
 /// One streamed candidate.
 #[derive(Default)]
 struct ChatResult {
@@ -692,10 +767,15 @@ async fn stream_chat(
     };
 
     let started = Instant::now();
-    let mut response = request
-        .send()
-        .await
-        .map_err(|error| request_error(&error, &base))?;
+    // The request itself must be cancellable: a server that accepts the
+    // connection and stalls would otherwise keep the Cancel button inert for
+    // the whole connect + read timeout.
+    let sent = tokio::select! {
+        biased;
+        () = cancel_signal(cancel) => return Err(TranslationError::new(ErrorKind::Cancelled)),
+        result = request.send() => result,
+    };
+    let mut response = sent.map_err(|error| request_error(&error, &base))?;
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
         let detail = status_detail(status, &response, config);
@@ -718,7 +798,7 @@ async fn stream_chat(
             break;
         };
         reader.push(&bytes);
-        while let Some(line) = reader.next_line() {
+        while let Some(line) = reader.next_line()? {
             if line.trim().is_empty() {
                 continue;
             }
@@ -838,26 +918,39 @@ impl LineReader {
     /// that terminates NDJSON or SSE frames with a bare CR must still work. A
     /// trailing `\r` is held back until the next byte arrives (it may be the
     /// first half of `\r\n`); [`Self::finish`] treats it as a terminator at EOF.
-    fn next_line(&mut self) -> Option<String> {
+    fn next_line(&mut self) -> Result<Option<String>, TranslationError> {
         let mut index = 0;
         while index < self.buffer.len() {
             match self.buffer[index] {
-                b'\n' => return Some(self.take_line(index, 1)),
+                b'\n' => {
+                    if index > MAX_LINE_BYTES {
+                        return Err(line_too_long());
+                    }
+                    return Ok(Some(self.take_line(index, 1)));
+                }
                 b'\r' => {
                     if index + 1 < self.buffer.len() {
+                        if index > MAX_LINE_BYTES {
+                            return Err(line_too_long());
+                        }
                         let width = if self.buffer[index + 1] == b'\n' {
                             2
                         } else {
                             1
                         };
-                        return Some(self.take_line(index, width));
+                        return Ok(Some(self.take_line(index, width)));
                     }
-                    return None;
+                    break;
                 }
                 _ => index += 1,
             }
         }
-        None
+        if self.buffer.len() > MAX_LINE_BYTES {
+            // A server that never terminates a line must not grow the buffer
+            // without bound; the response is unusable either way.
+            return Err(line_too_long());
+        }
+        Ok(None)
     }
 
     /// Remove and return the line ending at `end`, consuming `width` bytes of
@@ -876,6 +969,11 @@ impl LineReader {
         trim_carriage_return(&mut line);
         Some(String::from_utf8_lossy(&line).into_owned())
     }
+}
+
+/// The error returned when one streamed line grows past [`MAX_LINE_BYTES`].
+fn line_too_long() -> TranslationError {
+    TranslationError::new(ErrorKind::Unexpected).with_detail("stream line exceeds the 4 MiB limit")
 }
 
 fn trim_carriage_return(line: &mut Vec<u8>) {
@@ -982,12 +1080,67 @@ fn retry_config(config: &BackendConfig, attempt: usize) -> BackendConfig {
     retry
 }
 
-/// Fallback configuration only when it is a different object than the primary.
+/// True when two configurations address the same endpoint and model.
+///
+/// The pointer comparison the Python code uses only works because both sides
+/// share one object; two separately built configurations for the same server
+/// must not be retried as if one were a fallback.
+fn same_endpoint(left: &BackendConfig, right: &BackendConfig) -> bool {
+    left.compatible_base() == right.compatible_base() && left.model == right.model
+}
+
+/// Fallback configuration only when it addresses a different endpoint.
 fn distinct_fallback<'a>(request: &TranslateRequest<'a>) -> Option<&'a BackendConfig> {
-    match request.fallback {
-        Some(fallback) if !std::ptr::eq(fallback, request.config) => Some(fallback),
-        _ => None,
+    let fallback = request.fallback?;
+    if same_endpoint(fallback, request.config) {
+        None
+    } else {
+        Some(fallback)
     }
+}
+
+/// Build the result a caller keeps when the fallback also fails.
+///
+/// Blocks that were already translated stay as they are, the remaining lines
+/// are copied from the source and counted as warnings, so the caller receives
+/// a complete document with an accurate "lines left in the source language"
+/// count instead of the fallback's error.
+fn abandon_job(
+    error: TranslationError,
+    chunks: &[TextChunk],
+    mut translated: Vec<String>,
+    index: usize,
+    progress: JobProgress,
+) -> JobFailure {
+    let mut warnings = progress.warnings;
+    for chunk in &chunks[index..] {
+        translated.push(format!("{}{}", chunk.prefix, chunk.text));
+        warnings += 1;
+    }
+    JobFailure {
+        error,
+        partial: JobResult {
+            text: TextChunker::compose(chunks, &translated).unwrap_or_default(),
+            warnings,
+            tokens: progress.tokens,
+            seconds: progress.seconds,
+            degenerate: warnings > 0 && progress.translated_count == 0,
+        },
+    }
+}
+
+/// Drop repeated prompts while keeping the order of first occurrence.
+///
+/// `Auto` and a non-standard tone describe the same style as `Natural`, so the
+/// ladder would otherwise send a byte-identical request twice per block.
+fn unique_prompts(prompts: Vec<String>) -> Vec<String> {
+    let mut unique: Vec<String> = Vec::with_capacity(prompts.len());
+    for prompt in prompts {
+        if !unique.contains(&prompt) {
+            unique.push(prompt);
+        }
+    }
+    unique
 }
 
 /// Recompose the translated prefix for a partial result.
