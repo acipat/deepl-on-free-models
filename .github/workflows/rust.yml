@@ -100,12 +100,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - name: Install the Tauri CLI
-        # The npm package is a prebuilt binary, far quicker than `cargo install`.
-        run: npm install --global "@tauri-apps/cli@^2"
       - name: Build the installers
         working-directory: rust/crates/desktop
-        run: cargo tauri build --verbose
+        # `cargo tauri` needs `cargo install tauri-cli`; the npm package is a
+        # prebuilt binary and is invoked directly, which is much faster and does
+        # not depend on the global bin directory being on PATH.
+        run: npx --yes "@tauri-apps/cli@^2" build --verbose
       - name: List what was produced
         working-directory: rust/target/release/bundle
         run: Get-ChildItem -Recurse -Include *.msi,*.exe | Select-Object FullName, Length
