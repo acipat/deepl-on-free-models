@@ -31,3 +31,11 @@ thiserror = "2"
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
+
+# Ship small, fast binaries: the release build is what users download.
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
