@@ -1,7 +1,9 @@
 name: rust
 
 on:
+  # On a branch only the pull request runs, so a push is not reported twice.
   push:
+    branches: [main]
     paths:
       - "rust/**"
       - ".github/workflows/rust.yml"
@@ -9,6 +11,7 @@ on:
     paths:
       - "rust/**"
       - ".github/workflows/rust.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -24,6 +27,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # The macOS runner pool is scarce here, so a pull request does not wait for
+    # it; `main` and manual runs still cover macOS.
+    if: matrix.os != 'macos-latest' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -60,6 +66,7 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    if: matrix.os != 'macos-latest' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
