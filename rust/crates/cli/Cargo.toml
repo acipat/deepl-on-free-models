@@ -1,0 +1,29 @@
+[package]
+name = "ofm-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ofm-i18n = { path = "../i18n", version = "2.0.1" }
+ofm-text = { path = "../text", version = "2.0.1" }
+ofm-config = { path = "../config", version = "2.0.1" }
+ofm-net = { path = "../net", version = "2.0.1" }
+ofm-docs = { path = "../docs", version = "2.0.1" }
+
+clap = { version = "4.5.61", features = ["derive"] }
+env_logger.workspace = true
+log.workspace = true
+ofm-app = { version = "2.0.1", path = "../app" }
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "time"] }
+ofm-store = { version = "2.0.1", path = "../store" }
+
+[[bin]]
+name = "ofm"
+path = "src/main.rs"
+
+[dev-dependencies]
+serde_json.workspace = true

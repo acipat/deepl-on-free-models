@@ -618,6 +618,16 @@ _TAIL: dict[str, dict[str, str]] = {
         "pt": "Limpar histórico",
         "it": "Cancella cronologia",
     },
+    "Translation cancelled.": {
+        "uk": "Переклад скасовано.",
+        "ru": "Перевод отменён.",
+        "de": "Übersetzung abgebrochen.",
+        "fr": "Traduction annulée.",
+        "es": "Traducción cancelada.",
+        "pl": "Tłumaczenie anulowane.",
+        "pt": "Tradução cancelada.",
+        "it": "Traduzione annullata.",
+    },
 }
 
 _merge(_TAIL)
