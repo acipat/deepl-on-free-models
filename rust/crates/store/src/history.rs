@@ -911,6 +911,10 @@ mod tests {
     }
 
     /// Leftover `*.tmp` files in the store directory.
+    ///
+    /// Only the Unix test can make a directory read-only, so this helper is
+    /// dead code elsewhere.
+    #[cfg(unix)]
     fn temporary_files(dir: &TempDir) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(dir.path())
             .expect("read_dir")
