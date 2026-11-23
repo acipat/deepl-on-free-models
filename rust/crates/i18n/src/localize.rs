@@ -295,12 +295,12 @@ mod tests {
     }
 
     #[test]
-    fn catalogue_has_302_keys_per_language() {
+    fn catalogue_has_305_keys_per_language() {
         assert_eq!(catalog::TABLES.len(), TABLE_COUNT);
         for (index, table) in catalog::TABLES.iter().enumerate() {
             assert_eq!(
                 table.len(),
-                302,
+                305,
                 "{:?} has {} keys",
                 TABLE_LANGUAGES[index],
                 table.len()
