@@ -67,10 +67,7 @@ mod macos {
                 wanted
             } else {
                 language_voice = voice_for_language(language_code);
-                match language_voice.as_deref() {
-                    Some(name) => name,
-                    None => "",
-                }
+                language_voice.as_deref().unwrap_or_default()
             };
             if !voice.is_empty() {
                 command.arg("-v").arg(voice);
