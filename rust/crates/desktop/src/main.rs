@@ -1,0 +1,390 @@
+//! Tauri v2 shell for DeepL-oFM.
+//!
+//! The shell owns the window, the tray, the global shortcuts and the bridge:
+//! every command is a thin wrapper around [`ofm_app::AppController`], and every
+//! state change reaches the frontend as an `app://event` payload. Building this
+//! crate needs the platform WebView libraries, so it is excluded from the
+//! workspace default members.
+
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod commands;
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use ofm_app::{AppController, AppEvent};
+use tauri::{Emitter, Manager};
+
+/// Shared controller handed to every command.
+pub struct Shared {
+    pub controller: Arc<AppController>,
+    /// Actions requested on the command line, read once by the frontend.
+    pub startup: Mutex<Startup>,
+}
+
+/// Command-line actions the window applies after it has loaded.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Startup {
+    /// Open the model catalogue.
+    pub catalog: bool,
+    /// Text the Write tab should start with.
+    pub write_text: Option<String>,
+    /// Tab requested on the command line.
+    pub tab: Option<String>,
+}
+
+/// Parse the flags the Python build accepted so existing shortcuts keep working.
+fn parse_arguments() -> Startup {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let mut startup = Startup::default();
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = arguments[index].as_str();
+        let next = || arguments.get(index + 1).cloned();
+        match argument {
+            "--prefill" | "--open-file" | "--translate-file" | "--write-text" | "--tab" => {
+                let Some(value) = next() else {
+                    eprintln!("{argument} needs a value");
+                    break;
+                };
+                match argument {
+                    "--prefill" => startup.write_text = None,
+                    "--tab" => startup.tab = Some(value),
+                    "--write-text" => startup.write_text = Some(value),
+                    _ => {}
+                }
+                index += 1;
+            }
+            "--catalog" => startup.catalog = true,
+            // Handled by `main` before this runs.
+            "--debug" | "--translate-clipboard" | "--connect" | "--load-fallback-models" => {}
+            "--help" | "-h" => {
+                println!(
+                    "DeepL-oFM\n\n\
+                     --prefill <text>          start with this text\n\
+                     --tab <translate|files|write|history>\n\
+                     --open-file <path>        translate a document at launch\n\
+                     --translate-file <path>   same as --open-file\n\
+                     --write-text <text>       open Write with a draft\n\
+                     --translate-clipboard     translate the clipboard at launch\n\
+                     --connect                 connect and load the model list\n\
+                     --load-fallback-models    load the fallback model list\n\
+                     --catalog                 open the model catalogue\n\
+                     --debug                   verbose log"
+                );
+                std::process::exit(0);
+            }
+            other => eprintln!("unknown argument: {other}"),
+        }
+        index += 1;
+    }
+    startup
+}
+
+/// Controller mutations requested on the command line.
+fn apply_startup_actions(controller: &Arc<AppController>, arguments: &[String]) {
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--prefill" => {
+                if let Some(value) = arguments.get(index + 1) {
+                    controller.set_tab("translate");
+                    controller.set_source_text(value);
+                    index += 1;
+                }
+            }
+            "--tab" => {
+                if let Some(value) = arguments.get(index + 1) {
+                    controller.set_tab(value);
+                    index += 1;
+                }
+            }
+            "--open-file" | "--translate-file" => {
+                if let Some(value) = arguments.get(index + 1) {
+                    controller.set_tab("files");
+                    controller.start_file_translation(std::path::Path::new(value), None);
+                    index += 1;
+                }
+            }
+            "--write-text" => {
+                if arguments.get(index + 1).is_some() {
+                    controller.set_tab("write");
+                    index += 1;
+                }
+            }
+            "--translate-clipboard" => controller.translate_clipboard(),
+            "--connect" => controller.connect_and_load_models(),
+            "--load-fallback-models" => controller.load_fallback_models(),
+            _ => {}
+        }
+        index += 1;
+    }
+}
+
+fn main() {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let debug = arguments.iter().any(|argument| argument == "--debug");
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(if debug {
+        "debug"
+    } else {
+        "info"
+    }))
+    .init();
+
+    let controller = Arc::new(AppController::new());
+    let startup = parse_arguments();
+
+    tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+            // A second launch may carry a file to translate.
+            let controller = app.state::<Shared>().controller.clone();
+            apply_startup_actions(&controller, &argv);
+        }))
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        .manage(Shared {
+            controller: Arc::clone(&controller),
+            startup: Mutex::new(startup.clone()),
+        })
+        .setup(move |app| {
+            install_tray(&app.handle().clone())?;
+            install_hotkeys(&app.handle().clone(), Arc::clone(&controller));
+
+            // Forward controller events to the webview and keep the tray in sync.
+            let handle = app.handle().clone();
+            let mut events = controller.subscribe();
+            let tray_controller = Arc::clone(&controller);
+            let tray_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    match events.recv().await {
+                        Ok(event) => {
+                            if matches!(event, AppEvent::Settings { .. }) {
+                                sync_tray_visibility(&tray_handle, &tray_controller);
+                            }
+                            if let Ok(payload) = serde_json::to_value(&event) {
+                                let _ = handle.emit("app://event", payload);
+                            }
+                        }
+                        // A slow frontend may miss events; the next one carries
+                        // enough information for it to refresh the whole state.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+
+            // Probe at launch like the Python build, then warm a local model up
+            // only when the setting asks for it.
+            controller.check_connection();
+            controller.warm_up();
+            apply_startup_actions(&controller, &arguments);
+            sync_tray_visibility(&app.handle().clone(), &controller);
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let controller = window.app_handle().state::<Shared>().controller.clone();
+                // Closing hides the window when the app lives in the tray; on
+                // macOS a window-less app stays reachable through the Dock.
+                if controller.show_in_menu_bar() || cfg!(target_os = "macos") {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::get_state,
+            commands::get_startup,
+            commands::translate_text,
+            commands::cancel,
+            commands::set_source_text,
+            commands::set_source_language,
+            commands::set_target_language,
+            commands::swap_languages,
+            commands::set_style,
+            commands::set_tone,
+            commands::set_result_view,
+            commands::clear_source,
+            commands::copy_translation,
+            commands::copy_source,
+            commands::translate_clipboard,
+            commands::translate_selection,
+            commands::speak,
+            commands::stop_speaking,
+            commands::check_connection,
+            commands::connect_and_load_models,
+            commands::load_fallback_models,
+            commands::apply_catalog_entry,
+            commands::apply_model,
+            commands::get_catalog,
+            commands::get_diagnostics,
+            commands::get_settings,
+            commands::save_settings,
+            commands::set_interface_language,
+            commands::set_tab,
+            commands::translate_file,
+            commands::cancel_file_translation,
+            commands::save_translated_file,
+            commands::clear_file_job,
+            commands::write_text,
+            commands::cancel_write,
+            commands::history_list,
+            commands::history_search,
+            commands::history_delete,
+            commands::history_clear,
+            commands::load_history_entry,
+            commands::list_models,
+            commands::list_voices,
+            commands::pick_save_path,
+            commands::preview_prompt,
+            commands::read_clipboard,
+            commands::copy_text,
+            commands::open_url,
+            commands::reveal_in_folder,
+            commands::pick_file,
+            commands::get_translations,
+        ])
+        .build(tauri::generate_context!())
+        .expect("failed to build DeepL-oFM")
+        .run(|app, event| {
+            // macOS: clicking the Dock icon with no window reopens it.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows,
+                ..
+            } = event
+            {
+                if !has_visible_windows {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+        });
+}
+
+/// Register both global shortcuts and dispatch them from a polling thread.
+fn install_hotkeys(app: &tauri::AppHandle, controller: Arc<AppController>) {
+    use ofm_platform::hotkeys::HotkeyManager;
+
+    if !HotkeyManager::is_supported() {
+        controller.set_hotkey_message(
+            "clipboard",
+            Some("Global shortcuts are not available on this system.".to_string()),
+        );
+        return;
+    }
+
+    let manager = Arc::new(Mutex::new(HotkeyManager::new()));
+    register_shortcuts(&manager, &controller);
+
+    // Re-register whenever the user changes a combination.
+    let watch_controller = Arc::clone(&controller);
+    let watch_manager = Arc::clone(&manager);
+    let mut events = controller.subscribe();
+    tauri::async_runtime::spawn(async move {
+        while let Ok(event) = events.recv().await {
+            if matches!(event, AppEvent::Settings { .. }) {
+                register_shortcuts(&watch_manager, &watch_controller);
+            }
+        }
+    });
+
+    let dispatch_controller = Arc::clone(&controller);
+    let dispatch_app = app.clone();
+    std::thread::spawn(move || loop {
+        let actions = {
+            let mut guard = manager.lock().unwrap_or_else(|poison| poison.into_inner());
+            guard.poll()
+        };
+        for action in actions {
+            if let Some(window) = dispatch_app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+            match action.as_str() {
+                "clipboard" => dispatch_controller.translate_clipboard(),
+                "selection" => dispatch_controller.translate_selection(),
+                other => log::debug!("unhandled hotkey action: {other}"),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(60));
+    });
+}
+
+/// (Re)register both shortcuts, reporting failures into the Hot keys tab.
+fn register_shortcuts(
+    manager: &Arc<Mutex<ofm_platform::hotkeys::HotkeyManager>>,
+    controller: &Arc<AppController>,
+) {
+    let settings = controller.state().settings;
+    let mut guard = manager.lock().unwrap_or_else(|poison| poison.into_inner());
+    guard.unregister_all();
+
+    let clipboard = guard.register("clipboard", &settings.hot_key).err();
+    controller.set_hotkey_message(
+        "clipboard",
+        clipboard.map(|error| error.message_key.replace("%@", &settings.hot_key.display())),
+    );
+
+    let selection = guard
+        .register("selection", &settings.selection_hot_key)
+        .err();
+    controller.set_hotkey_message(
+        "selection",
+        selection.map(|error| {
+            error
+                .message_key
+                .replace("%@", &settings.selection_hot_key.display())
+        }),
+    );
+}
+
+/// Show or hide the tray icon to match the setting.
+fn sync_tray_visibility(app: &tauri::AppHandle, controller: &Arc<AppController>) {
+    if let Some(tray) = app.tray_by_id("main") {
+        let _ = tray.set_visible(controller.show_in_menu_bar());
+    }
+}
+
+/// Menu-bar icon with "Show" and "Quit", mirroring the macOS app.
+fn install_tray(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::TrayIconBuilder;
+
+    let show = MenuItem::with_id(app, "show", "Show DeepL-oFM", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit DeepL-oFM", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+
+    let mut builder = TrayIconBuilder::with_id("main")
+        .menu(&menu)
+        .tooltip("DeepL-oFM")
+        .show_menu_on_left_click(true)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+            "quit" => app.exit(0),
+            _ => {}
+        });
+
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+
+    builder.build(app)?;
+    Ok(())
+}

@@ -1,0 +1,23 @@
+[package]
+name = "ofm-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ofm-i18n = { path = "../i18n", version = "2.0.1" }
+ofm-text = { path = "../text", version = "2.0.1" }
+ofm-config = { path = "../config", version = "2.0.1" }
+ofm-net = { path = "../net", version = "2.0.1" }
+ofm-docs = { path = "../docs", version = "2.0.1" }
+ofm-store = { path = "../store", version = "2.0.1" }
+ofm-platform = { path = "../platform", version = "2.0.1" }
+
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "sync", "time"] }

@@ -1,0 +1,341 @@
+# Release pipeline for the Rust port of DeepL-oFM.
+#
+# Triggered by a `rust-v*` tag (or manually). It builds:
+#   * ofm-cli with plain cargo on every platform,
+#   * the Tauri v2 desktop shell through tauri-apps/tauri-action,
+# then stages, checksums and attaches everything to a DRAFT GitHub Release.
+#
+# Code-signing secrets are optional. When they are absent the release is still
+# produced, unsigned, and the run is green: nothing here requires a secret.
+#
+# Signing secrets (see rust/packaging/README.md):
+#   WINDOWS_CERT_PFX_BASE64 / WINDOWS_CERT_PASSWORD
+#   APPLE_CERT_P12_BASE64 / APPLE_CERT_PASSWORD
+#   APPLE_SIGNING_IDENTITY / APPLE_ID / APPLE_TEAM_ID / APPLE_PASSWORD
+
+name: release
+
+on:
+  push:
+    tags:
+      - "rust-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create or update (default: rust-v<version>)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+# Group by the release tag rather than by ref: a tag push and a manual dispatch
+# for the same tag must not publish concurrently.
+concurrency:
+  group: release-${{ github.ref_type == 'tag' && github.ref_name || inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  metadata:
+    name: Resolve version and tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the version from tauri.conf.json
+        id: meta
+        env:
+          REQUESTED_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          version="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' \
+            rust/crates/desktop/tauri.conf.json)"
+          tag="${REQUESTED_TAG:-rust-v${version}}"
+          case "$tag" in
+            rust-v*) ;;
+            *)
+              echo "::error::The release tag must start with 'rust-v', got '$tag'."
+              exit 1
+              ;;
+          esac
+          if [ "$tag" != "rust-v${version}" ]; then
+            echo "::warning::Tag '$tag' does not match the workspace version '$version' (expected rust-v$version)."
+          fi
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.platform }}
+    needs: metadata
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            os: windows-latest
+            desktop: true
+            artifacts: "windows-x64"
+            tauri_args: ""
+            timeout: 60
+          - platform: macos-universal
+            os: macos-latest
+            desktop: true
+            artifacts: "macos-universal"
+            tauri_args: "--target universal-apple-darwin"
+            timeout: 90
+          - platform: linux-x86_64
+            os: ubuntu-latest
+            desktop: false
+            artifacts: "linux-x86_64"
+            tauri_args: ""
+            timeout: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Add the macOS universal targets
+        if: matrix.platform == 'macos-universal'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: release-${{ matrix.platform }}
+
+      - name: Install the Linux WebKit build dependencies
+        if: matrix.platform == 'linux-x86_64' && matrix.desktop
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
+
+      # tauri-action can fall back to a global @tauri-apps/cli download when the
+      # project has no package.json. Install the Rust CLI explicitly instead so
+      # CI and rust/packaging/* run exactly the same `cargo tauri` command.
+      - name: Install the Tauri CLI
+        if: matrix.desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! cargo tauri --version >/dev/null 2>&1; then
+            cargo install tauri-cli --version "^2" --locked
+          fi
+          cargo tauri --version
+
+      # tauri.conf.json lists crates/desktop/icons/*, which is build output and
+      # therefore not committed. Generate it before tauri-action runs; this is
+      # the exact command documented in rust/packaging/README.md.
+      - name: Generate the icon set (only when missing)
+        if: matrix.desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          icons="rust/crates/desktop/icons"
+          if [ -f "$icons/icon.ico" ] && [ -f "$icons/icon.icns" ]; then
+            echo "The icon set is already present."
+            exit 0
+          fi
+          ( cd rust && cargo tauri icon ../docs/app-icon.png --output crates/desktop/icons )
+          ls -l "$icons"
+
+      - name: Build the CLI
+        shell: bash
+        working-directory: rust
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.platform }}" = "macos-universal" ]; then
+            cargo build --release -p ofm-cli --target aarch64-apple-darwin
+            cargo build --release -p ofm-cli --target x86_64-apple-darwin
+          else
+            cargo build --release -p ofm-cli
+          fi
+
+      # Optional: import the Developer ID certificate into a throw-away keychain
+      # and expose only APPLE_SIGNING_IDENTITY to the next steps. When the
+      # secret is missing this step does nothing and the DMG stays unsigned.
+      - name: Prepare the macOS signing identity (optional)
+        if: matrix.platform == 'macos-universal'
+        shell: bash
+        env:
+          CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CERT_P12_BASE64:-}" ] || [ -z "${CERT_PASSWORD:-}" ]; then
+            echo "No Apple signing certificate configured; the DMG will be unsigned."
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/deepl-ofm-signing.keychain-db"
+          security create-keychain -p "" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "" "$keychain"
+          printf '%s' "$CERT_P12_BASE64" | base64 -D > "$RUNNER_TEMP/signing.p12"
+          security import "$RUNNER_TEMP/signing.p12" -k "$keychain" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security list-keychains -d user -s "$keychain" \
+            $(security list-keychains -d user | tr -d '"')
+          security set-key-partition-list -S apple-tool:,apple: -k "" "$keychain" >/dev/null
+          identity="${IDENTITY:-}"
+          if [ -z "$identity" ]; then
+            identity="$(security find-identity -v -p codesigning "$keychain" \
+              | sed -n 's/.*"\(.*\)".*/\1/p' | head -n 1)"
+          fi
+          if [ -z "$identity" ]; then
+            echo "::error::Imported the certificate but found no codesigning identity."
+            exit 1
+          fi
+          echo "APPLE_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo "Signing the macOS bundle with: $identity"
+
+      # The desktop shell is bundled by tauri-action on both desktop platforms.
+      # No tagName/releaseId is passed: the assets are attached to the draft
+      # release by the `publish` job, so three parallel jobs never race for it.
+      - name: Bundle the desktop app
+        if: matrix.desktop
+        uses: tauri-apps/tauri-action@v1
+        with:
+          projectPath: rust/crates/desktop
+          tauriScript: cargo tauri
+          args: ${{ matrix.tauri_args }}
+          uploadUpdaterJson: false
+
+      # Reuse the packaging scripts for staging/checksums so a manual release
+      # and a CI release produce identical files.
+      - name: Stage the Windows artifacts (optional Authenticode signing)
+        if: matrix.platform == 'windows-x64'
+        shell: pwsh
+        env:
+          CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not [string]::IsNullOrWhiteSpace($env:CERT_PFX_BASE64)) {
+            $pfx = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
+            [System.IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_PFX_BASE64))
+            $env:CODESIGN_CERT = $pfx
+            $env:CODESIGN_PASSWORD = $env:CERT_PASSWORD
+            Write-Host 'A Windows signing certificate was provided; signing the artifacts.'
+          } else {
+            Write-Host 'No Windows signing certificate provided; the artifacts will be unsigned.'
+          }
+          & ./rust/packaging/windows/build.ps1 -SkipBuild -SkipIconGeneration
+          # The script only sets $LASTEXITCODE when it calls `exit`; $null/0 mean
+          # success and a non-zero value must fail the step.
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Stage the macOS artifacts (optional notarization)
+        if: matrix.platform == 'macos-universal'
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+        run: rust/packaging/macos/build.sh --stage-only
+
+      - name: Build the Linux CLI tarball
+        if: matrix.platform == 'linux-x86_64'
+        shell: bash
+        run: rust/packaging/linux/build.sh
+
+      - name: List the staged assets
+        shell: bash
+        run: ls -l rust/dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.artifacts }}
+          path: rust/dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Draft release
+    needs: [metadata, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List the release assets
+        run: ls -l dist
+
+      # The three platform scripts each publish SHA256SUMS-<platform>.txt for a
+      # downloaded archive. Check them here so a corrupt upload never reaches
+      # the release page.
+      - name: Verify the per-platform checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          sums=(dist/SHA256SUMS-*.txt)
+          if [ "${#sums[@]}" -eq 0 ]; then
+            echo "::error::No SHA256SUMS-*.txt was uploaded by the build jobs."
+            exit 1
+          fi
+          cd dist
+          for file in SHA256SUMS-*.txt; do
+            echo "== $file"
+            cat "$file"
+            sha256sum -c --strict "$file"
+          done
+
+      # One checksum file for the whole release, covering every attached asset.
+      - name: Write the aggregate SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$(find dist -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' | wc -l)" -eq 0 ]; then
+            echo "::error::No release assets were downloaded."
+            exit 1
+          fi
+          cd dist
+          find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -printf '%f\n' \
+            | LC_ALL=C sort \
+            | while IFS= read -r name; do sha256sum "$name"; done > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          sha256sum -c --strict SHA256SUMS.txt
+
+      - name: Create or reuse the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; adding the new assets to it."
+          else
+            gh release create "$TAG" \
+              --draft \
+              --target "$GITHUB_SHA" \
+              --title "DeepL-oFM $VERSION (Rust)" \
+              --generate-notes
+          fi
+
+      - name: Upload the assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" dist/* --clobber
