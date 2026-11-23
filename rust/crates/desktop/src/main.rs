@@ -277,7 +277,9 @@ fn main() {
 
 /// Register both global shortcuts and dispatch them from a polling thread.
 fn install_hotkeys(app: &tauri::AppHandle, controller: Arc<AppController>) {
+    use ofm_config::KeyCombo;
     use ofm_platform::hotkeys::HotkeyManager;
+    use std::sync::mpsc::{channel, Sender};
 
     if !HotkeyManager::is_supported() {
         controller.set_hotkey_message(
@@ -287,22 +289,33 @@ fn install_hotkeys(app: &tauri::AppHandle, controller: Arc<AppController>) {
         return;
     }
 
-    let manager = Arc::new(Mutex::new(HotkeyManager::new()));
-    register_shortcuts(&manager, &controller);
+    // `GlobalHotKeyManager` owns a message window and is neither `Send` nor
+    // `Sync`, so it cannot be shared: one thread owns it and everything else
+    // reaches it through a channel. Registration, polling and dispatch all
+    // happen on that thread, which is also where the OS expects them.
+    let (updates, changes) = channel::<(KeyCombo, KeyCombo)>();
+    let settings = controller.state().settings;
+    let _ = updates.send((settings.hot_key.clone(), settings.selection_hot_key.clone()));
 
-    // Re-register whenever the user changes a combination.
-    let watch_controller = Arc::clone(&controller);
-    let watch_manager = Arc::clone(&manager);
+    // Forward every settings change to the owning thread.
     let mut events = controller.subscribe();
+    let watch_controller = Arc::clone(&controller);
+    let settings_updates: Sender<(KeyCombo, KeyCombo)> = updates.clone();
     tauri::async_runtime::spawn(async move {
         loop {
             match events.recv().await {
                 Ok(AppEvent::Settings { .. }) => {
-                    register_shortcuts(&watch_manager, &watch_controller);
+                    let settings = watch_controller.state().settings;
+                    if settings_updates
+                        .send((settings.hot_key.clone(), settings.selection_hot_key.clone()))
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
-                // A burst of events may overflow the channel; skipping one must
-                // not stop the watcher, or settings changes stop registering.
-                Ok(_) => {}
+                // A burst may overflow the channel; skipping one must not stop
+                // the watcher, or shortcut changes would stop registering.
+                Ok(_) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
@@ -311,51 +324,49 @@ fn install_hotkeys(app: &tauri::AppHandle, controller: Arc<AppController>) {
 
     let dispatch_controller = Arc::clone(&controller);
     let dispatch_app = app.clone();
-    std::thread::spawn(move || loop {
-        let actions = {
-            let mut guard = manager.lock().unwrap_or_else(|poison| poison.into_inner());
-            guard.poll()
-        };
-        for action in actions {
-            if let Some(window) = dispatch_app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
+    std::thread::spawn(move || {
+        let mut manager = HotkeyManager::new();
+
+        loop {
+            // Apply pending shortcut changes first, then dispatch presses.
+            while let Ok((clipboard, selection)) = changes.try_recv() {
+                apply_shortcuts(&mut manager, &dispatch_controller, &clipboard, &selection);
             }
-            match action.as_str() {
-                "clipboard" => dispatch_controller.translate_clipboard(),
-                "selection" => dispatch_controller.translate_selection(),
-                other => log::debug!("unhandled hotkey action: {other}"),
+            for action in manager.poll() {
+                if let Some(window) = dispatch_app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+                match action.as_str() {
+                    "clipboard" => dispatch_controller.translate_clipboard(),
+                    "selection" => dispatch_controller.translate_selection(),
+                    other => log::debug!("unhandled hotkey action: {other}"),
+                }
             }
+            std::thread::sleep(Duration::from_millis(60));
         }
-        std::thread::sleep(Duration::from_millis(60));
     });
 }
 
-/// (Re)register both shortcuts, reporting failures into the Hot keys tab.
-fn register_shortcuts(
-    manager: &Arc<Mutex<ofm_platform::hotkeys::HotkeyManager>>,
+/// Register both shortcuts on the owning thread, reporting failures to the UI.
+fn apply_shortcuts(
+    manager: &mut ofm_platform::hotkeys::HotkeyManager,
     controller: &Arc<AppController>,
+    clipboard: &ofm_config::KeyCombo,
+    selection: &ofm_config::KeyCombo,
 ) {
-    let settings = controller.state().settings;
-    let mut guard = manager.lock().unwrap_or_else(|poison| poison.into_inner());
-    guard.unregister_all();
+    manager.unregister_all();
 
-    let clipboard = guard.register("clipboard", &settings.hot_key).err();
+    let clipboard_error = manager.register("clipboard", clipboard).err();
     controller.set_hotkey_message(
         "clipboard",
-        clipboard.map(|error| error.message_key.replace("%@", &settings.hot_key.display())),
+        clipboard_error.map(|error| error.message_key.replace("%@", &clipboard.display())),
     );
 
-    let selection = guard
-        .register("selection", &settings.selection_hot_key)
-        .err();
+    let selection_error = manager.register("selection", selection).err();
     controller.set_hotkey_message(
         "selection",
-        selection.map(|error| {
-            error
-                .message_key
-                .replace("%@", &settings.selection_hot_key.display())
-        }),
+        selection_error.map(|error| error.message_key.replace("%@", &selection.display())),
     );
 }
 
