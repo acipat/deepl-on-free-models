@@ -48,6 +48,30 @@ pub fn save_settings(state: State<'_, Shared>, settings: Value) -> Result<Value,
     Ok(state_json(controller(&state)))
 }
 
+/// "Open at login" state: `{ "status": ..., "error": ... }`.
+#[tauri::command]
+pub fn get_login_item(state: State<'_, Shared>) -> Result<Value, String> {
+    let snapshot = controller(&state).state();
+    Ok(json!({
+        "status": snapshot.login_item_status,
+        "error": snapshot.login_item_error,
+    }))
+}
+
+/// Turn "Open at login" on or off; the controller emits `loginItem`.
+#[tauri::command]
+pub fn set_login_item(state: State<'_, Shared>, enabled: bool) -> Result<(), String> {
+    controller(&state).set_login_item(enabled);
+    Ok(())
+}
+
+/// Open the system page where login items are approved.
+#[tauri::command]
+pub fn open_login_item_settings(state: State<'_, Shared>) -> Result<(), String> {
+    controller(&state).open_login_item_settings();
+    Ok(())
+}
+
 #[tauri::command]
 pub fn get_catalog() -> Result<Value, String> {
     Ok(ofm_app::catalog_json())

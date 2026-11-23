@@ -561,7 +561,15 @@ svg.icon-sprite {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
-  gap: 18px;
+  gap: 8px;
+  min-width: 0;
+  padding: 0 16px;
+}
+
+/* Equal flexible space on both sides of the fixed-width language cluster
+   keeps the pickers and the swap button centred over the pane divider. */
+.bar-spacer {
+  flex: 1 1 0;
   min-width: 0;
 }
 
@@ -614,12 +622,9 @@ svg.icon-sprite {
   pointer-events: none;
 }
 
-.lang-source select {
-  width: 236px;
-}
-
+.lang-source select,
 .lang-target select {
-  width: 172px;
+  width: 164px;
 }
 
 .swap-btn {
@@ -650,11 +655,57 @@ svg.icon-sprite {
 }
 
 .chips-bar {
-  margin-left: auto;
+  flex: 1 1 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.chips-full,
+.chips-compact {
   display: flex;
   align-items: center;
   gap: 8px;
-  min-width: 0;
+  flex: 0 0 auto;
+}
+
+/* The compact pair never needs less than this; without the floor the two
+   halves could no longer be equal at the smallest window sizes. */
+body.has-compact-controls .chips-bar {
+  min-width: 224px;
+}
+
+.chips-full .segment {
+  padding: 0 10px;
+}
+
+.chips-full .caption-tone {
+  margin-left: 4px;
+}
+
+.compact-control {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.compact-control .select-wrap select {
+  width: 90px;
+  padding: 0 24px 0 10px;
+}
+
+.compact-glyph {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 14px;
+  letter-spacing: -0.02em;
 }
 
 .caption {
@@ -802,20 +853,23 @@ svg.icon-sprite {
 
 .card-body {
   flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
 }
 
 .source-body {
+  min-width: 0;
   padding: 0 18px 14px;
 }
 
 .source-input {
   flex: 1 1 auto;
   width: 100%;
+  min-width: 0;
   min-height: 0;
-  padding: 6px 0;
+  padding: 16px 20px 10px;
   border: 0;
   outline: 0;
   resize: none;
@@ -834,9 +888,10 @@ svg.icon-sprite {
 
 .source-preview {
   flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
   overflow-y: auto;
-  padding: 6px 0;
+  padding: 16px 20px 10px;
   scrollbar-gutter: stable;
 }
 
@@ -850,16 +905,18 @@ svg.icon-sprite {
 }
 
 .result-body {
+  min-width: 0;
   padding: 0 18px 14px;
 }
 
 .result-scroll {
   flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
   overflow-y: auto;
-  padding-right: 4px;
+  padding: 12px 10px 0;
   scrollbar-gutter: stable;
 }
 
@@ -1839,6 +1896,10 @@ svg.icon-sprite {
 
 .write-panes {
   min-height: 0;
+}
+
+.write-panes .source-input {
+  padding: 4px 6px;
 }
 
 .busy-label {
@@ -3155,23 +3216,16 @@ input::placeholder {
 /* Responsive -------------------------------------------------------------- */
 
 @media (max-width: 1060px) {
-  .lang-source select {
-    width: 204px;
-  }
-
-  .lang-target select {
-    width: 152px;
-  }
-
-  .chips-bar {
+  .chips-bar,
+  .chips-full {
     gap: 6px;
   }
 
-  .segment {
+  .chips-full .segment {
     padding: 0 9px;
   }
 
-  .caption-tone {
+  .chips-full .caption-tone {
     margin-left: 2px;
   }
 
@@ -3238,16 +3292,9 @@ input::placeholder {
     padding: 20px 18px 24px;
   }
 
-  .chips-bar .caption {
-    display: none;
-  }
-
-  .lang-source select {
-    width: 180px;
-  }
-
+  .lang-source select,
   .lang-target select {
-    width: 140px;
+    width: 164px;
   }
 
   .page-head-row {

@@ -7,6 +7,24 @@
 (function () {
   "use strict";
 
+  /* The language bar is sized from constants, never from measured text: the
+     two pickers are a fixed 164 px, so a long language name cannot move the
+     cluster.  The full style/tone chips are modelled as 1100 px plus five
+     pixels per translated label character; the same numbers decide the Qt
+     bar's breakpoint. */
+  const FULL_CHIPS_BASE_WIDTH = 1100;
+  const FULL_CHIPS_PER_CHARACTER = 5;
+  const CHIP_LABELS = [
+    "Style",
+    "Auto",
+    "Literal",
+    "Natural",
+    "Tone",
+    "Default",
+    "Formal",
+    "Casual",
+  ];
+
   /* ------------------------------------------------------------------ data */
 
   const PROVIDERS = [
@@ -788,6 +806,7 @@
     fileTarget: "",
     fileJobTarget: "",
     firstStateLoaded: false,
+    translateBarWidth: 0,
     startupApplied: false,
     dialogStack: [],
     resultKeys: {},
@@ -873,11 +892,17 @@
       "stopSpeaking",
       "statusMetrics",
       "toastRegion",
+      "translateTop",
       "sourceLang",
       "targetLang",
       "swapBtn",
+      "chipsBar",
+      "chipsFull",
+      "chipsCompact",
       "styleChips",
       "toneChips",
+      "styleCompact",
+      "toneCompact",
       "sourceInput",
       "sourceCounter",
       "speakSourceBtn",
@@ -1118,6 +1143,9 @@
     setSegment(els.promptStyleChips, "style", local.promptStyle);
     setSegment(els.promptToneChips, "tone", local.promptTone);
     setSegment(els.writeViewSwitch, "view", local.writeView);
+    fillCompactSelect(els.styleCompact, els.styleChips, "style");
+    fillCompactSelect(els.toneCompact, els.toneChips, "tone");
+    syncCompactControls();
   }
 
   function fillSelect(select, options) {
@@ -1178,6 +1206,7 @@
     if (!els.settingsTitle.textContent) els.settingsTitle.textContent = tr("Settings");
     buildStaticOptions();
     render();
+    updateStyleToneMode(local.translateBarWidth);
   }
 
   function setSegment(group, attribute, value) {
@@ -1187,6 +1216,68 @@
       button.classList.toggle("is-active", active);
       button.setAttribute("aria-pressed", active ? "true" : "false");
     });
+  }
+
+  /* -------------------------------------------------- responsive bar state */
+
+  function fullChipsThreshold() {
+    const characters = CHIP_LABELS.reduce(
+      (total, label) => total + Array.from(tr(label)).length,
+      0
+    );
+    return FULL_CHIPS_BASE_WIDTH + characters * FULL_CHIPS_PER_CHARACTER;
+  }
+
+  function updateStyleToneMode(width) {
+    if (!els.chipsFull || !els.chipsCompact) return;
+    const compact = width > 0 && width < fullChipsThreshold();
+    els.chipsFull.hidden = compact;
+    els.chipsCompact.hidden = !compact;
+    document.body.classList.toggle("has-compact-controls", compact);
+  }
+
+  function fillCompactSelect(select, group, attribute) {
+    if (!select || !group) return;
+    const previous = select.value;
+    select.replaceChildren();
+    group.querySelectorAll("[data-" + attribute + "]").forEach((button) => {
+      const option = el("option", null, button.textContent.trim());
+      option.value = button.getAttribute("data-" + attribute);
+      select.append(option);
+    });
+    if (previous) select.value = previous;
+  }
+
+  function syncCompactControls() {
+    [
+      [els.styleCompact, "style", "Style"],
+      [els.toneCompact, "tone", "Tone"],
+    ].forEach(([select, key, caption]) => {
+      if (!select) return;
+      if (select.value !== state[key]) select.value = state[key];
+      const option = select.selectedOptions && select.selectedOptions[0];
+      select.title = option ? tr(caption) + " · " + option.textContent : tr(caption);
+    });
+  }
+
+  function syncLanguageTitles() {
+    [els.sourceLang, els.targetLang].forEach((select) => {
+      if (!select) return;
+      const option = select.selectedOptions && select.selectedOptions[0];
+      select.title = option ? option.textContent : "";
+    });
+  }
+
+  function observeTranslateBar() {
+    if (!els.translateTop) return;
+    if (typeof ResizeObserver === "undefined") return;
+    local.translateObserver = new ResizeObserver((entries) => {
+      const entry = entries[entries.length - 1];
+      if (!entry) return;
+      local.translateBarWidth = entry.contentRect.width;
+      updateStyleToneMode(local.translateBarWidth);
+    });
+    local.translateObserver.observe(els.translateTop);
   }
 
   /* ---------------------------------------------------------------- rendering */
@@ -1265,8 +1356,10 @@
   function renderTranslate() {
     if (els.sourceLang.value !== state.sourceLanguage) els.sourceLang.value = state.sourceLanguage;
     if (els.targetLang.value !== state.targetLanguage) els.targetLang.value = state.targetLanguage;
+    syncLanguageTitles();
     setSegment(els.styleChips, "style", state.style);
     setSegment(els.toneChips, "tone", state.tone);
+    syncCompactControls();
     setSegment(els.viewSwitch, "view", state.resultView);
 
     // Never clobber the textarea while the user is typing in it.
@@ -3309,10 +3402,12 @@
     // Translate ----------------------------------------------------------
     els.sourceLang.addEventListener("change", () => {
       state.sourceLanguage = els.sourceLang.value;
+      syncLanguageTitles();
       send("set_source_language", { code: state.sourceLanguage });
     });
     els.targetLang.addEventListener("change", () => {
       state.targetLanguage = els.targetLang.value;
+      syncLanguageTitles();
       send("set_target_language", { code: state.targetLanguage });
     });
     els.swapBtn.addEventListener("click", () => send("swap_languages"));
@@ -3321,6 +3416,7 @@
       if (!button) return;
       state.style = button.getAttribute("data-style");
       setSegment(els.styleChips, "style", state.style);
+      syncCompactControls();
       send("set_style", { style: state.style });
     });
     els.toneChips.addEventListener("click", (event) => {
@@ -3328,6 +3424,19 @@
       if (!button) return;
       state.tone = button.getAttribute("data-tone");
       setSegment(els.toneChips, "tone", state.tone);
+      syncCompactControls();
+      send("set_tone", { tone: state.tone });
+    });
+    els.styleCompact.addEventListener("change", () => {
+      state.style = els.styleCompact.value;
+      setSegment(els.styleChips, "style", state.style);
+      syncCompactControls();
+      send("set_style", { style: state.style });
+    });
+    els.toneCompact.addEventListener("change", () => {
+      state.tone = els.toneCompact.value;
+      setSegment(els.toneChips, "tone", state.tone);
+      syncCompactControls();
       send("set_tone", { tone: state.tone });
     });
     els.viewSwitch.addEventListener("click", (event) => {
@@ -4001,6 +4110,7 @@
     applyTheme();
     buildStaticOptions();
     localize();
+    observeTranslateBar();
     bindEvents();
     listenNativeDrop();
     subscribe(handleEvent);
