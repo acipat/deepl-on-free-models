@@ -26,9 +26,10 @@ use tokio::runtime::Runtime;
 
 use ofm_config::{AppSettings, CatalogEntry, ModelCatalog, Provider};
 use ofm_docs::{DocumentKind, DocumentTranslator};
-use ofm_i18n::{t, t_in, AppLanguage, Language, LanguageTable};
+use ofm_i18n::{t, t_in, tf, AppLanguage, Language, LanguageTable};
 use ofm_net::{CancelFlag, Translator};
 use ofm_platform::speech::Speaker;
+use ofm_platform::startup::{StartupLocation, StartupStatus};
 use ofm_store::{HistoryEntry, HistoryStore, SecretStore};
 use ofm_text::{PromptBuilder, TranslationStyle, TranslationTone};
 
@@ -65,6 +66,9 @@ struct Inner {
 
     /// Where settings are persisted; `None` means the platform default.
     settings_path: Option<PathBuf>,
+
+    /// Login-item backend; injectable so tests never touch the user profile.
+    startup: StartupLocation,
 }
 
 /// The single entry point every frontend uses.
@@ -77,7 +81,7 @@ impl AppController {
     /// Create the controller: loads settings and history, starts the async
     /// runtime and prepares the translator.
     pub fn new() -> Self {
-        Self::build(None)
+        Self::build(None, StartupLocation::new())
     }
 
     /// Controller whose settings, history and secrets live in `directory`.
@@ -85,10 +89,10 @@ impl AppController {
     /// Tests use this so they never read or write the real user profile (which
     /// is read-only in a sandbox, making key storage silently fail).
     pub fn with_directory(directory: &Path) -> Self {
-        Self::build(Some(directory.to_path_buf()))
+        Self::build(Some(directory.to_path_buf()), StartupLocation::new())
     }
 
-    fn build(directory: Option<PathBuf>) -> Self {
+    fn build(directory: Option<PathBuf>, startup: StartupLocation) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_name("ofm-worker")
@@ -136,7 +140,7 @@ impl AppController {
 
         let (events, _) = tokio::sync::broadcast::channel(256);
 
-        Self {
+        let controller = Self {
             inner: Arc::new(Inner {
                 runtime,
                 settings: RwLock::new(settings),
@@ -156,8 +160,13 @@ impl AppController {
                 write_cancel: Mutex::new(None),
                 write_generation: AtomicU64::new(0),
                 settings_path: directory.map(|dir| dir.join("settings.json")),
+                startup,
             }),
-        }
+        };
+        // Read the real registration once so the settings dialog starts with
+        // the platform state; `status()` never creates anything.
+        controller.refresh_login_item();
+        controller
     }
 
     // ------------------------------------------------------------- plumbing
@@ -237,6 +246,54 @@ impl AppController {
             state.error_message = Some(message.clone());
         }
         self.emit(AppEvent::Error { value: message });
+    }
+
+    // ------------------------------------------------------------ login item
+
+    /// Read the platform's "Open at login" state and publish it.
+    fn refresh_login_item(&self) {
+        let status = self.inner.startup.status();
+        {
+            let mut state = self.inner.state.write().unwrap_or_else(|p| p.into_inner());
+            state.login_item_status = status.value().to_string();
+            state.login_item_error = None;
+        }
+        self.emit(AppEvent::LoginItem {
+            value: status.value().to_string(),
+        });
+    }
+
+    /// Turn "Open at login" on or off.
+    ///
+    /// A platform failure is stored in `login_item_error` with the same
+    /// "Could not change Open at login. %@" template as the macOS app instead of
+    /// panicking; the status is re-read afterwards, because the system is the
+    /// source of truth.
+    pub fn set_login_item(&self, enabled: bool) {
+        let outcome = self.inner.startup.set_enabled(enabled);
+        let status = self.inner.startup.status();
+        let error = match outcome {
+            Err(failure) if login_item_mismatch(enabled, status) => Some(tf(
+                "Could not change Open at login. %@",
+                &[&failure.message],
+            )),
+            _ => None,
+        };
+        {
+            let mut state = self.inner.state.write().unwrap_or_else(|p| p.into_inner());
+            state.login_item_status = status.value().to_string();
+            state.login_item_error = error;
+        }
+        self.emit(AppEvent::LoginItem {
+            value: status.value().to_string(),
+        });
+    }
+
+    /// Open the system page where login items are approved.
+    ///
+    /// Returns `false` when the platform has no such page.
+    pub fn open_login_item_settings(&self) -> bool {
+        self.inner.startup.open_settings()
     }
 
     // --------------------------------------------------------------- tabs
@@ -1956,6 +2013,14 @@ fn send(inner: &Arc<Inner>, event: AppEvent) {
     let _ = inner.events.send(event);
 }
 
+/// Whether the platform state contradicts the requested login-item state.
+///
+/// `RequiresApproval` is an acceptable outcome: the user has to approve the
+/// item in System Settings, which is not a failure.
+fn login_item_mismatch(enabled: bool, status: StartupStatus) -> bool {
+    status != StartupStatus::RequiresApproval && enabled != (status == StartupStatus::Enabled)
+}
+
 fn set_status(inner: &Arc<Inner>, status: BackendStatus, message: impl Into<String>) {
     let message = message.into();
     {
@@ -2612,6 +2677,28 @@ mod translation_tests {
         assert_eq!(controller.translations_json()["Settings"], "Налаштування");
         ofm_i18n::set_language(AppLanguage::En);
     }
+
+    #[test]
+    fn login_item_strings_are_translated() {
+        let _controller = controller();
+        ofm_i18n::set_language(AppLanguage::Uk);
+
+        assert_ne!(t("Open at login"), "Open at login");
+        // `t_in` is independent of the global language, so checking the two
+        // other keys cannot race with tests that switch the language.
+        for key in [
+            "Allow DeepL-oFM to open at login in System Settings.",
+            "Could not change Open at login. %@",
+        ] {
+            assert_ne!(
+                t_in(key, AppLanguage::Uk),
+                key,
+                "missing from the Ukrainian catalogue"
+            );
+        }
+
+        ofm_i18n::set_language(AppLanguage::En);
+    }
 }
 
 #[cfg(test)]
@@ -2872,6 +2959,110 @@ mod concurrency_tests {
         assert!(
             second.is_translating,
             "a cleared pane must not be served from the cache"
+        );
+    }
+}
+
+#[cfg(all(test, unix, not(target_os = "macos")))]
+mod login_item_tests {
+    use super::*;
+
+    /// A controller whose profile and login-item home live in a temp folder,
+    /// so the real user profile is never read or written.
+    struct Fixture {
+        directory: PathBuf,
+        controller: AppController,
+    }
+
+    impl Fixture {
+        fn new(tag: &str) -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "ofm-app-login-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|value| value.as_nanos())
+                    .unwrap_or(0)
+            ));
+            let profile = directory.join("profile");
+            let login_home = directory.join("home");
+            std::fs::create_dir_all(&profile).expect("create the profile");
+            std::fs::create_dir_all(&login_home).expect("create the login home");
+            let controller =
+                AppController::build(Some(profile), StartupLocation::with_root(login_home));
+            Self {
+                directory,
+                controller,
+            }
+        }
+
+        fn entry(&self) -> PathBuf {
+            self.directory
+                .join("home")
+                .join(".config")
+                .join("autostart")
+                .join("deepl-ofm.desktop")
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[test]
+    fn construction_reads_the_platform_status() {
+        let fixture = Fixture::new("status");
+        let state = fixture.controller.state();
+        assert_eq!(state.login_item_status, "disabled");
+        assert!(state.login_item_error.is_none());
+    }
+
+    #[test]
+    fn enabling_and_disabling_update_the_state() {
+        let fixture = Fixture::new("toggle");
+
+        fixture.controller.set_login_item(true);
+        let state = fixture.controller.state();
+        assert_eq!(state.login_item_status, "enabled");
+        assert!(state.login_item_error.is_none());
+        assert!(fixture.entry().is_file());
+
+        fixture.controller.set_login_item(false);
+        let state = fixture.controller.state();
+        assert_eq!(state.login_item_status, "disabled");
+        assert!(!fixture.entry().exists());
+    }
+
+    #[test]
+    fn changes_emit_a_login_item_event() {
+        let fixture = Fixture::new("event");
+        let mut events = fixture.controller.subscribe();
+
+        fixture.controller.set_login_item(true);
+
+        let mut emitted = None;
+        while let Ok(event) = events.try_recv() {
+            if let AppEvent::LoginItem { value } = event {
+                emitted = Some(value);
+            }
+        }
+        assert_eq!(emitted.as_deref(), Some("enabled"));
+    }
+
+    #[test]
+    fn a_platform_failure_is_kept_as_an_error() {
+        let fixture = Fixture::new("failure");
+        std::fs::write(fixture.directory.join("home").join(".config"), b"blocked")
+            .expect("block the autostart parent");
+
+        fixture.controller.set_login_item(true);
+        let state = fixture.controller.state();
+        assert_eq!(state.login_item_status, "disabled");
+        assert!(
+            state.login_item_error.is_some(),
+            "the platform failure must be shown to the user"
         );
     }
 }
