@@ -61,6 +61,10 @@ mod tests {
         assert_eq!(root, PathBuf::from("/xdg/config"));
     }
 
+    /// The fallback cannot be redirected on Windows: `dirs::home_dir` asks the
+    /// OS for the profile folder instead of reading `HOME`, so the environment
+    /// trick used here only works on Unix.
+    #[cfg(unix)]
     #[test]
     fn configuration_root_falls_back_to_home() {
         let _guard = crate::test_support::env_lock();
@@ -69,6 +73,7 @@ mod tests {
         assert_eq!(directory_from(|_| None), dir.path().join(".config"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn empty_variables_are_ignored() {
         let _guard = crate::test_support::env_lock();
@@ -76,5 +81,13 @@ mod tests {
         std::env::set_var("HOME", dir.path());
         let root = directory_from(|_| Some(std::ffi::OsString::new()));
         assert_eq!(root, dir.path().join(".config"));
+    }
+
+    /// Windows falls back to the profile folder, which the OS owns.
+    #[cfg(windows)]
+    #[test]
+    fn the_fallback_appends_config_to_the_profile_directory() {
+        let root = directory_from(|_| None);
+        assert_eq!(root, home_directory().join(".config"));
     }
 }
