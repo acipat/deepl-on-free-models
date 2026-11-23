@@ -22,6 +22,10 @@ pub(crate) enum StoreError {
     #[error("backend error: {0}")]
     Backend(String),
     /// The requested mechanism does not exist on this platform.
+    ///
+    /// Constructed only by the non-Windows DPAPI stubs, so it is dead code on
+    /// Windows, where the real implementation lives.
+    #[cfg_attr(windows, allow(dead_code))]
     #[error("{0} is not available on this platform")]
     Unsupported(&'static str),
 }
