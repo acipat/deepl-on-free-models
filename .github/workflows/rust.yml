@@ -24,12 +24,16 @@ jobs:
   test:
     strategy:
       fail-fast: false
+      # The macOS runner pool is scarce here, so a pull request does not wait
+      # for it; `main` and manual runs still cover macOS.
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: >-
+          ${{
+            github.event_name == 'pull_request'
+              && fromJSON('["ubuntu-latest","windows-latest"]')
+              || fromJSON('["ubuntu-latest","windows-latest","macos-latest"]')
+          }}
     runs-on: ${{ matrix.os }}
-    # The macOS runner pool is scarce here, so a pull request does not wait for
-    # it; `main` and manual runs still cover macOS.
-    if: matrix.os != 'macos-latest' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -64,9 +68,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        os: >-
+          ${{
+            github.event_name == 'pull_request'
+              && fromJSON('["windows-latest"]')
+              || fromJSON('["windows-latest","macos-latest"]')
+          }}
     runs-on: ${{ matrix.os }}
-    if: matrix.os != 'macos-latest' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
