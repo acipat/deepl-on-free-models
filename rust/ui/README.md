@@ -83,7 +83,7 @@ Manual single shot:
 google-chrome --headless=new --disable-gpu --no-sandbox --hide-scrollbars \
   --user-data-dir="$(mktemp -d)" --window-size=1180,800 \
   --screenshot=docs-translate.png \
-  "file:///home/vvb/deepl/rust/ui/index.html?still=1#translate"
+  "file:///path/to/rust/ui/index.html?still=1#translate"
 ```
 
 Screenshots and hashes are listed in the table above; `docs-uk-*.png` are the
