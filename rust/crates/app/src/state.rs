@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use ofm_config::AppSettings;
+use ofm_platform::startup::StartupStatus;
 use ofm_store::HistoryEntry;
 
 /// Backend connection state shown in the status bar.
@@ -215,6 +216,11 @@ pub struct AppState {
     pub hotkey_message: String,
     /// Status of the selection hotkey (empty when it works).
     pub selection_hotkey_message: String,
+    /// "Open at login" status: `enabled`, `disabled`, `requiresApproval` or
+    /// `unsupported`.
+    pub login_item_status: String,
+    /// Localised failure from the last "Open at login" change.
+    pub login_item_error: Option<String>,
     /// Files tab job.
     pub file_job: Option<FileJob>,
     /// Write tab state.
@@ -260,6 +266,8 @@ impl Default for AppState {
             speaking: String::new(),
             hotkey_message: String::new(),
             selection_hotkey_message: String::new(),
+            login_item_status: StartupStatus::Disabled.value().to_string(),
+            login_item_error: None,
             file_job: None,
             write: WriteState::default(),
             history: Vec::new(),
@@ -379,6 +387,11 @@ pub enum AppEvent {
         /// One of `translate`, `files`, `write`, `history`.
         value: String,
     },
+    /// The "Open at login" status changed.
+    LoginItem {
+        /// One of `enabled`, `disabled`, `requiresApproval`, `unsupported`.
+        value: String,
+    },
     /// History changed.
     History,
     /// The Files job changed.
@@ -487,6 +500,9 @@ mod tests {
                 value: "files".to_string(),
             },
             AppEvent::History,
+            AppEvent::LoginItem {
+                value: "enabled".to_string(),
+            },
             AppEvent::FileJob {
                 value: Box::new(FileJob::default()),
             },
