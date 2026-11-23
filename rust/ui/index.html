@@ -5,16 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <title>DeepL-oFM</title>
-  <script>
-    // Apply a forced scheme (and the deterministic-screenshot flag) before the
-    // first paint, so ?theme=dark never flashes the light palette.
-    (function () {
-      var params = new URLSearchParams(location.search);
-      var theme = params.get("theme");
-      if (theme === "dark" || theme === "light") document.documentElement.dataset.theme = theme;
-      if (params.has("still")) document.documentElement.dataset.motion = "off";
-    })();
-  </script>
+  <!-- A same-origin file, not an inline script: the shell's CSP forbids inline. -->
+  <script src="boot.js"></script>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
