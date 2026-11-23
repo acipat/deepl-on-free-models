@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpListener;
 
 use ofm_config::{BackendConfig, BackendKind};
 use ofm_i18n::{AppLanguage, Language, LanguageTable};
@@ -1370,4 +1372,226 @@ async fn a_whitespace_padded_model_id_is_still_rejected() {
 
     assert_eq!(error.kind, ErrorKind::Model);
     assert_eq!(server.request_count(), 0);
+}
+
+// ------------------------------------------------- 10. audit round 2 fixes
+
+#[tokio::test]
+async fn an_over_cap_rewrite_with_a_marker_is_not_accepted() {
+    // A rambling rewrite that hits the 512 KB cap and then leaks a marker is a
+    // truncation, not a finished answer: it must be rejected as too long.
+    let padding = "y".repeat(512_000);
+    let server = FakeServer::start(move |_| {
+        Reply::stream(vec![
+            ollama_frame(&padding),
+            ollama_frame("xhy_end"),
+            ollama_done(1, 500_000_000),
+        ])
+    })
+    .await;
+    let config = ollama_config(&server, "hy-mt2:7b");
+
+    let error = Translator::new()
+        .rewrite("some text", language("en"), &config, None, None)
+        .await
+        .expect_err("rewrite output too long");
+
+    assert_eq!(error.kind, ErrorKind::Empty);
+    assert!(error.detail.contains("too long"), "{}", error.detail);
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_a_stalled_request() {
+    // A server that accepts the connection and never answers must not keep the
+    // Cancel button inert until the read timeout expires.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 4096];
+                let _ = socket.read(&mut buffer).await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+        }
+    });
+
+    let config = BackendConfig {
+        kind: BackendKind::Ollama,
+        base_url: format!("http://{address}"),
+        model: "hy-mt2:7b".to_string(),
+        ..BackendConfig::default()
+    };
+    let translator = Translator::new();
+    let text = "Привіт.".to_string();
+    let source = language("uk");
+    let target = language("en");
+    let flag: CancelFlag = Arc::new(AtomicBool::new(false));
+    let task_flag = Arc::clone(&flag);
+    let task = tokio::spawn(async move {
+        translator
+            .translate(TranslateRequest {
+                text: &text,
+                source,
+                target,
+                style: TranslationStyle::Auto,
+                tone: TranslationTone::Standard,
+                config: &config,
+                fallback: None,
+                cancel: Some(task_flag),
+                on_progress: None,
+                on_partial: None,
+            })
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    flag.store(true, Ordering::SeqCst);
+    let started = Instant::now();
+    let joined = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("cancel observed")
+        .expect("joined");
+    let error = joined.expect_err("cancelled");
+
+    assert_eq!(error.kind, ErrorKind::Cancelled);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_failed_fallback_keeps_the_primary_partial_result() {
+    // Primary translates the first block, then fails. The fallback fails too:
+    // the caller keeps the primary's work (translated block + source tail).
+    let primary_server = FakeServer::start(|request| {
+        if request.content().contains("Перший") {
+            Reply::stream(vec![
+                ollama_frame("First line."),
+                ollama_done(1, 500_000_000),
+            ])
+        } else {
+            Reply::status(500)
+        }
+    })
+    .await;
+    let fallback_server = FakeServer::start(|_| Reply::status(500)).await;
+    let primary = ollama_config(&primary_server, "primary");
+    let backup = ollama_config(&fallback_server, "backup");
+
+    let output = translate(
+        &Translator::new(),
+        "Перший рядок.\nДругий рядок.",
+        &primary,
+        Some(&backup),
+        None,
+    )
+    .await
+    .expect("primary partial result");
+
+    assert_eq!(output.text, "First line.\nДругий рядок.");
+    assert_eq!(output.warnings, 1);
+    assert!(!output.used_fallback);
+}
+
+#[tokio::test]
+async fn a_failed_fallback_keeps_a_degenerate_primary_result() {
+    let primary_server = FakeServer::start(|_| Reply::stream(vec![empty_done()])).await;
+    let fallback_server = FakeServer::start(|_| Reply::status(500)).await;
+    let primary = ollama_config(&primary_server, "primary");
+    let backup = ollama_config(&fallback_server, "backup");
+
+    let output = translate(&Translator::new(), "Привіт.", &primary, Some(&backup), None)
+        .await
+        .expect("primary result");
+
+    assert_eq!(output.text, "Привіт.");
+    assert_eq!(output.warnings, 1);
+    assert!(!output.used_fallback);
+}
+
+#[tokio::test]
+async fn an_identical_fallback_endpoint_is_not_retried() {
+    let server = FakeServer::start(|_| Reply::status(500)).await;
+    let primary = ollama_config(&server, "hy-mt2:7b");
+    let mut fallback = ollama_config(&server, "hy-mt2:7b");
+    fallback.temperature = 0.5;
+
+    let error = translate(
+        &Translator::new(),
+        "Привіт.",
+        &primary,
+        Some(&fallback),
+        None,
+    )
+    .await
+    .expect_err("server error");
+
+    assert_eq!(error.kind, ErrorKind::Server);
+    assert_eq!(
+        server.request_count(),
+        1,
+        "the same endpoint is not retried"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_prompts_are_sent_once() {
+    // Auto + a non-standard tone describes the same style as Natural, so the
+    // styled and natural prompts are byte-identical.
+    let server = FakeServer::start(|_| Reply::stream(vec![empty_done()])).await;
+    let config = ollama_config(&server, "hy-mt2:7b");
+    let source = "Це досить довгий рядок, який перевищує вісімдесят символів, \
+                  щоб увімкнути стильову драбину.";
+    assert!(source.chars().count() > 80);
+
+    let output = Translator::new()
+        .translate(TranslateRequest {
+            text: source,
+            source: language("uk"),
+            target: language("en"),
+            style: TranslationStyle::Auto,
+            tone: TranslationTone::Formal,
+            config: &config,
+            fallback: None,
+            cancel: None,
+            on_progress: None,
+            on_partial: None,
+        })
+        .await
+        .expect("translated");
+
+    assert_eq!(output.warnings, 1);
+    // [styled x3, plain x2] instead of [styled x3, natural x2, plain x2].
+    assert_eq!(server.request_count(), 5);
+
+    let mut prompts: Vec<String> = server
+        .requests()
+        .iter()
+        .map(|request| request.content().to_string())
+        .collect();
+    prompts.sort();
+    prompts.dedup();
+    assert_eq!(prompts.len(), 2, "no byte-identical prompt is sent twice");
+}
+
+#[tokio::test]
+async fn an_endless_line_is_rejected_instead_of_buffered() {
+    let blob = "x".repeat(5 * 1024 * 1024 + 64);
+    let server = FakeServer::start(move |_| Reply::body(blob.clone().into_bytes())).await;
+
+    let error = translate(
+        &Translator::new(),
+        "Привіт.",
+        &ollama_config(&server, "hy-mt2:7b"),
+        None,
+        None,
+    )
+    .await
+    .expect_err("oversized line");
+
+    assert_eq!(error.kind, ErrorKind::Unexpected);
+    assert!(error.detail.contains("4 MiB"), "{}", error.detail);
 }

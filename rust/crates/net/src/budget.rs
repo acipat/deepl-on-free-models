@@ -107,6 +107,16 @@ impl OutputBudget {
                 self.bytes.truncate(keep);
             } else if offset - overlap <= remaining {
                 self.bytes.extend_from_slice(&window[overlap..offset]);
+            } else {
+                // The marker starts behind the byte cap: the cap truncated the
+                // generation, so this is an overflow, not a finished answer
+                // (`TranslationService.swift:1128`). Keep the part that fitted
+                // under the cap so nothing already accepted is thrown away.
+                self.exceeded_limit = true;
+                let under_cap = overlap + remaining;
+                self.bytes
+                    .extend_from_slice(&window[overlap..under_cap.min(offset)]);
+                self.trim_to_char_boundary();
             }
             return false;
         }
@@ -117,6 +127,16 @@ impl OutputBudget {
         }
         self.bytes.extend_from_slice(fragment);
         true
+    }
+
+    /// Drop a partially written UTF-8 character at the end of the buffer.
+    ///
+    /// Only the overflow branch can cut a multi-byte character, because it
+    /// stops at a byte offset chosen by the cap rather than by the producer.
+    fn trim_to_char_boundary(&mut self) {
+        if let Err(error) = std::str::from_utf8(&self.bytes) {
+            self.bytes.truncate(error.valid_up_to());
+        }
     }
 }
 
@@ -161,11 +181,44 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_past_the_cap_is_an_overflow() {
+        // Marker reached after the cap already truncated the generation.
+        let mut output = OutputBudget::new(10);
+        assert!(output.append("abcdefghij"));
+        assert!(!output.append("KL<|"));
+        assert!(output.exceeded_limit());
+        assert_eq!(output.text(), "abcdefghij");
+
+        // The same overrun inside one piece: only the capped prefix is kept.
+        let mut output = OutputBudget::new(10);
+        assert!(!output.append("abcdefghijk<|"));
+        assert!(output.exceeded_limit());
+        assert_eq!(output.text(), "abcdefghij");
+    }
+
+    #[test]
+    fn an_overflow_marker_keeps_only_whole_characters() {
+        // The marker starts past the cap inside a multi-byte character; the
+        // bytes that fitted are kept up to the last complete character.
+        let mut output = OutputBudget::new(4);
+        assert!(output.append("\u{4e00}"));
+        assert!(!output.append("\u{4e00}<|"));
+        assert!(output.exceeded_limit());
+        assert_eq!(output.text(), "\u{4e00}");
+    }
+
+    #[test]
     fn marker_at_the_cap_is_not_an_overflow() {
         let mut exact = OutputBudget::new(4);
         assert!(!exact.append("ééHY_END"));
         assert!(!exact.exceeded_limit());
         assert_eq!(exact.text(), "éé");
+
+        let mut exact = OutputBudget::new(10);
+        assert!(exact.append("abcdefghij"));
+        assert!(!exact.append("<|"));
+        assert!(!exact.exceeded_limit());
+        assert_eq!(exact.text(), "abcdefghij");
     }
 
     #[test]
