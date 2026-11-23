@@ -629,7 +629,7 @@
     const forcedLanguage = params.get("lang");
     if (forcedLanguage) state.settings.interfaceLanguage = forcedLanguage;
     const fileJobDone = {
-      path: "/home/vvb/Documents/quarterly-report.pdf",
+      path: "~/Documents/quarterly-report.pdf",
       name: "quarterly-report.pdf",
       kind: "pdf",
       size: 1284000,
@@ -637,7 +637,7 @@
       completed: 11,
       total: 11,
       percent: 100,
-      output: "/home/vvb/Documents/quarterly-report_uk.pdf",
+      output: "~/Documents/quarterly-report_uk.pdf",
       resultName: "quarterly-report_uk.pdf",
       message: null,
       warnings: 2,
@@ -676,7 +676,7 @@
     } else if (hash === "files-progress") {
       state.tab = "files";
       state.fileJob = {
-        path: "/home/vvb/Documents/quarterly-report.pdf",
+        path: "~/Documents/quarterly-report.pdf",
         name: "quarterly-report.pdf",
         kind: "pdf",
         size: 1284000,
@@ -695,7 +695,7 @@
     } else if (hash === "files-error") {
       state.tab = "files";
       state.fileJob = {
-        path: "/home/vvb/Documents/scan.pdf",
+        path: "~/Documents/scan.pdf",
         name: "scan.pdf",
         kind: "pdf",
         size: 4820000,
@@ -1237,8 +1237,8 @@
     },
     get_diagnostics() {
       return {
-        settingsPath: "/home/vvb/.config/deepl-ofm/settings.json",
-        historyPath: "/home/vvb/.local/share/deepl-ofm/history.json",
+        settingsPath: "~/.config/deepl-ofm/settings.json",
+        historyPath: "~/.local/share/deepl-ofm/history.json",
         secretBackend: "Windows Credential Manager",
         version: "2.0.1",
         interfaceLanguage: state.settings.interfaceLanguage,
@@ -1274,15 +1274,15 @@
       return true;
     },
     pick_file() {
-      return "/home/vvb/Documents/quarterly-report.pdf";
+      return "~/Documents/quarterly-report.pdf";
     },
     pick_save_path(args) {
       const suggested = (args && args.suggestedName) || "translation.pdf";
-      return "/home/vvb/Documents/" + suggested;
+      return "~/Documents/" + suggested;
     },
     translate_file(args) {
       startFile(
-        (args && args.path) || "/home/vvb/Documents/quarterly-report.pdf",
+        (args && args.path) || "~/Documents/quarterly-report.pdf",
         args && args.target
       );
       return true;
