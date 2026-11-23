@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+# The desktop shell needs Tauri and the platform WebView libraries, which are not
+# available in a bare CI container. Everything else must build and test anywhere.
+default-members = [
+    "crates/i18n",
+    "crates/text",
+    "crates/config",
+    "crates/platform",
+    "crates/net",
+    "crates/docs",
+    "crates/store",
+    "crates/app",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "2.0.1"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+repository = "https://github.com/Lexus2016/deepl-on-free-models"
+authors = ["DeepL-oFM contributors"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
