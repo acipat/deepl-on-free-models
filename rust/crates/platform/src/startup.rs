@@ -382,7 +382,8 @@ mod macos {
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Output};
+    use std::process::{Command, Output, Stdio};
+    use std::time::{Duration, Instant};
 
     use super::{StartupError, StartupStatus};
 
@@ -395,14 +396,18 @@ mod macos {
     const LOGIN_ITEMS_PANE: &str =
         "x-apple.systempreferences:com.apple.LoginItems-Settings.extension";
 
+    /// Whether the login item is registered.
+    ///
+    /// This is a pure file check on purpose: it runs on every controller
+    /// construction, and asking `launchctl` would spawn two processes each time.
+    /// On a machine without a GUI session `launchctl print` can take seconds,
+    /// which turned a test run into a twenty-minute job. The plist is written
+    /// only after `bootstrap` succeeds, so its presence is the answer.
     pub(super) fn status(root: &Path) -> StartupStatus {
-        if root.as_os_str().is_empty() || !launchctl_available() {
+        if root.as_os_str().is_empty() {
             return StartupStatus::Unsupported;
         }
-        if !plist_path(root).is_file() {
-            return StartupStatus::Disabled;
-        }
-        if is_loaded() {
+        if plist_path(root).is_file() {
             StartupStatus::Enabled
         } else {
             StartupStatus::Disabled
@@ -474,17 +479,41 @@ mod macos {
         root.join("Library").join("LaunchAgents").join(PLIST_NAME)
     }
 
-    fn is_loaded() -> bool {
-        let target = format!("gui/{}/{LABEL}", user_id());
-        launchctl(&["print", target.as_str()]).is_some_and(|output| output.status.success())
-    }
-
-    fn launchctl_available() -> bool {
-        Command::new(LAUNCHCTL).arg("list").output().is_ok()
-    }
-
     fn launchctl(arguments: &[&str]) -> Option<Output> {
-        Command::new(LAUNCHCTL).args(arguments).output().ok()
+        launchctl_with_timeout(arguments, Duration::from_secs(5))
+    }
+
+    /// Run `launchctl`, killing it if it does not finish in time.
+    ///
+    /// `launchctl` talks to `launchd`, which may be slow or absent in a
+    /// non-interactive session; without a deadline a single call can block the
+    /// caller forever.
+    fn launchctl_with_timeout(arguments: &[&str], timeout: Duration) -> Option<Output> {
+        let mut child = Command::new(LAUNCHCTL)
+            .args(arguments)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .ok()?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return child.wait_with_output().ok(),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        }
     }
 
     fn command_error(output: &Output) -> String {
