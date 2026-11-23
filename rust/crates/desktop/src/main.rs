@@ -50,9 +50,11 @@ fn parse_arguments() -> Startup {
                     break;
                 };
                 match argument {
-                    "--prefill" => startup.write_text = None,
                     "--tab" => startup.tab = Some(value),
                     "--write-text" => startup.write_text = Some(value),
+                    // `--prefill` and the file flags are applied to the
+                    // controller before the webview loads, so they are not part
+                    // of the startup payload.
                     _ => {}
                 }
                 index += 1;
@@ -293,9 +295,16 @@ fn install_hotkeys(app: &tauri::AppHandle, controller: Arc<AppController>) {
     let watch_manager = Arc::clone(&manager);
     let mut events = controller.subscribe();
     tauri::async_runtime::spawn(async move {
-        while let Ok(event) = events.recv().await {
-            if matches!(event, AppEvent::Settings { .. }) {
-                register_shortcuts(&watch_manager, &watch_controller);
+        loop {
+            match events.recv().await {
+                Ok(AppEvent::Settings { .. }) => {
+                    register_shortcuts(&watch_manager, &watch_controller);
+                }
+                // A burst of events may overflow the channel; skipping one must
+                // not stop the watcher, or settings changes stop registering.
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     });

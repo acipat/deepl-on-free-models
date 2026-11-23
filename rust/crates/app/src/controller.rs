@@ -188,7 +188,10 @@ impl AppController {
                 .write()
                 .unwrap_or_else(|poison| poison.into_inner());
             mutate(&mut guard);
-            guard.save();
+            match &self.inner.settings_path {
+                Some(path) => guard.save_to(path),
+                None => guard.save(),
+            }
             guard.clone()
         };
         let mut state = self.inner.state.write().unwrap_or_else(|p| p.into_inner());
@@ -426,13 +429,8 @@ impl AppController {
     }
 
     fn detect_language_now(&self) {
-        let (text, ui) = {
-            let state = self.state_guard();
-            (
-                state.source_text.clone(),
-                self.settings().interface_language,
-            )
-        };
+        let text = self.state_guard().source_text.clone();
+        let ui = self.settings().interface_language;
         if text.trim().is_empty() {
             let mut state = self.inner.state.write().unwrap_or_else(|p| p.into_inner());
             state.detected_language = None;
@@ -582,14 +580,12 @@ impl AppController {
     // ---------------------------------------------------------- scheduling
 
     fn schedule_translation(&self) {
-        let (auto, delay, text) = {
+        // The two locks are never held at the same time: taking them in
+        // different orders on different threads deadlocks under `std::RwLock`.
+        let text = self.state_guard().source_text.clone();
+        let (auto, delay) = {
             let settings = self.settings();
-            let state = self.state_guard();
-            (
-                settings.auto_translate,
-                settings.debounce,
-                state.source_text.clone(),
-            )
+            (settings.auto_translate, settings.debounce)
         };
         if !auto || text.trim().is_empty() {
             return;
@@ -607,16 +603,15 @@ impl AppController {
     }
 
     fn retranslate_if_possible(&self) {
-        let (auto, has_text) = {
-            let state = self.state_guard();
-            (
-                self.settings().auto_translate,
-                !state.source_text.trim().is_empty(),
-            )
-        };
+        let has_text = !self.state_guard().source_text.trim().is_empty();
+        let auto = self.settings().auto_translate;
         if !has_text {
             return;
         }
+        // Supersede the running job first: otherwise `translate_now`'s
+        // `translating && !force` guard drops the new request and the style or
+        // tone change is silently ignored.
+        self.cancel();
         if auto {
             self.schedule_translation();
         } else {
@@ -727,13 +722,14 @@ impl AppController {
 
     /// Read the source or the translation aloud.
     pub fn speak(&self, target: &str) {
+        // Resolve the source language *before* taking the snapshot guard:
+        // `resolved_source` takes the same lock, and a recursive read on
+        // `std::sync::RwLock` can deadlock.
+        let source_code = self.resolved_source().code.to_string();
         let (text, code) = {
             let state = self.state_guard();
             if target == "source" {
-                (
-                    state.source_text.clone(),
-                    self.resolved_source().code.to_string(),
-                )
+                (state.source_text.clone(), source_code)
             } else {
                 (state.translated_text.clone(), state.target_language.clone())
             }
@@ -749,13 +745,49 @@ impl AppController {
             .unwrap_or_else(|p| p.into_inner())
             .speak(&text, &voice, &code);
         if started {
-            let mut state = self.inner.state.write().unwrap_or_else(|p| p.into_inner());
-            state.speaking = target.to_string();
-            drop(state);
+            {
+                let mut state = self.inner.state.write().unwrap_or_else(|p| p.into_inner());
+                state.speaking = target.to_string();
+            }
             self.emit(AppEvent::Speaking {
                 value: target.to_string(),
             });
+            self.watch_speech();
         }
+    }
+
+    /// Clear the "speaking" flag when the engine finishes by itself.
+    ///
+    /// The speech backends report no completion event, so the flag is polled;
+    /// without this the speaker button stays lit forever.
+    fn watch_speech(&self) {
+        let inner = Arc::clone(&self.inner);
+        self.inner.runtime.spawn(async move {
+            for _ in 0..120 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let speaking = inner
+                    .speaker
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_speaking();
+                if speaking {
+                    continue;
+                }
+                let was = {
+                    let mut state = inner.state.write().unwrap_or_else(|p| p.into_inner());
+                    std::mem::take(&mut state.speaking)
+                };
+                if !was.is_empty() {
+                    send(
+                        &inner,
+                        AppEvent::Speaking {
+                            value: String::new(),
+                        },
+                    );
+                }
+                return;
+            }
+        });
     }
 
     /// Stop reading aloud.
@@ -1108,6 +1140,10 @@ impl AppController {
             let mut state = self.inner.state.write().unwrap_or_else(|p| p.into_inner());
             state.settings = settings.clone();
             state.result_view = settings.result_view.clone();
+            state.style = settings.last_style.clone();
+            state.tone = settings.last_tone.clone();
+            state.source_language = settings.last_source_code.clone();
+            state.target_language = settings.last_target_code.clone();
         }
         self.emit(AppEvent::Settings {
             value: Box::new(settings),
@@ -1320,8 +1356,15 @@ impl AppController {
                     } else {
                         String::new()
                     };
-                    *inner.file_staging.lock().unwrap_or_else(|p| p.into_inner()) = Some(staging);
-                    file_done(&inner, generation, &written, warnings, used_fallback, label);
+                    // Only the current job may own the staging folder, or a
+                    // superseded job leaks it and a stale path could be saved.
+                    if inner.file_generation.load(Ordering::SeqCst) == generation {
+                        *inner.file_staging.lock().unwrap_or_else(|p| p.into_inner()) =
+                            Some(staging.clone());
+                        file_done(&inner, generation, &written, warnings, used_fallback, label);
+                    } else {
+                        let _ = std::fs::remove_dir_all(&staging);
+                    }
                 }
                 Err(error) => {
                     let _ = std::fs::remove_dir_all(&staging);
@@ -1473,8 +1516,13 @@ impl AppController {
     /// Improve a draft. Without an explicit language the text is improved in the
     /// language it is written in, like the macOS app.
     pub fn write_text(&self, text: &str, target_code: &str) {
-        if text.trim().is_empty() || self.state_guard().write.in_progress {
+        if text.trim().is_empty() {
             return;
+        }
+        // Supersede the previous rewrite rather than dropping this request: a
+        // user pressing Improve again expects the new draft to be handled.
+        if self.state_guard().write.in_progress {
+            self.cancel_write();
         }
         let config = self.settings().snapshot();
         if config.model.trim().is_empty() {
@@ -1539,7 +1587,10 @@ impl AppController {
                         .state
                         .write()
                         .unwrap_or_else(|p| p.into_inner());
-                    if state.write.output == chunk {
+                    // A cancelled or superseded rewrite must not repaint the pane.
+                    if partial_inner.write_generation.load(Ordering::SeqCst) != generation
+                        || state.write.output == chunk
+                    {
                         return;
                     }
                     state.write.output = chunk.to_string();
@@ -1672,6 +1723,9 @@ impl AppController {
 
     /// Restore an entry into the Translate tab.
     pub fn load_history_entry(&self, id: &str) {
+        // The in-flight translation would land on top of the restored entry.
+        self.cancel();
+        self.inner.debounce.fetch_add(1, Ordering::SeqCst);
         let Some(entry) = self
             .inner
             .history
@@ -1768,14 +1822,17 @@ impl AppController {
     pub fn set_provider_api_key(&self, key: &str) {
         let provider = self.settings().provider;
         self.store_key(provider, key);
-        {
+        let snapshot = {
             let mut settings = self
                 .inner
                 .settings
                 .write()
                 .unwrap_or_else(|p| p.into_inner());
             settings.api_key = key.to_string();
-        }
+            settings.clone()
+        };
+        let mut state = self.inner.state.write().unwrap_or_else(|p| p.into_inner());
+        state.settings = snapshot;
     }
 
     /// Warm the model up at launch, but only for a local provider.
@@ -2017,21 +2074,22 @@ fn file_cancelled(inner: &Arc<Inner>, generation: u64) {
 
 /// Start a translation for `inner`. Shared by the command and the debounce timer.
 fn translate_now(inner: &Arc<Inner>, force: bool) {
-    let (text, source_code, target_code, style_value, tone_value, config, fallback, auto) = {
+    // Take the two locks in sequence, never nested: another path takes them in
+    // the opposite order and `std::sync::RwLock` would deadlock.
+    let (text, source_code, target_code, style_value, tone_value) = {
         let state = inner.state.read().unwrap_or_else(|p| p.into_inner());
-        let settings = inner.settings.read().unwrap_or_else(|p| p.into_inner());
         (
             state.source_text.clone(),
             state.source_language.clone(),
             state.target_language.clone(),
             state.style.clone(),
             state.tone.clone(),
-            settings.snapshot(),
-            settings.fallback_config(),
-            settings.auto_translate,
         )
     };
-    let _ = auto;
+    let (config, fallback) = {
+        let settings = inner.settings.read().unwrap_or_else(|p| p.into_inner());
+        (settings.snapshot(), settings.fallback_config())
+    };
 
     if text.trim().is_empty() {
         return;
@@ -2076,10 +2134,17 @@ fn translate_now(inner: &Arc<Inner>, force: bool) {
         tone_value.clone(),
         config.model.clone(),
     );
-    let cached = {
-        let cache = inner.cache.lock().unwrap_or_else(|p| p.into_inner());
-        !force && cache.as_ref() == Some(&key)
-    };
+    // A cache hit only means "the pane already shows this exact result". If the
+    // text was cleared and retyped the pane is empty, so the request must run.
+    let cached = !force
+        && {
+            let cache = inner.cache.lock().unwrap_or_else(|p| p.into_inner());
+            cache.as_ref() == Some(&key)
+        }
+        && {
+            let state = inner.state.read().unwrap_or_else(|p| p.into_inner());
+            !state.translated_text.trim().is_empty()
+        };
     if cached {
         return;
     }
@@ -2128,11 +2193,15 @@ fn translate_now(inner: &Arc<Inner>, force: bool) {
         let started = Instant::now();
         let progress_worker = Arc::clone(&worker);
         let progress: ofm_net::ProgressFn = Arc::new(move |completed: usize, total: usize| {
+            // A superseded job must not move the counters of the new one.
             {
                 let mut state = progress_worker
                     .state
                     .write()
                     .unwrap_or_else(|p| p.into_inner());
+                if progress_worker.generation.load(Ordering::SeqCst) != generation {
+                    return;
+                }
                 state.completed = completed;
                 state.total = total;
             }
@@ -2665,5 +2734,144 @@ mod settings_tests {
         assert_eq!(after.model, before.model);
         assert_eq!(after.provider, before.provider);
         assert_eq!(after.interface_language, before.interface_language);
+    }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+
+    struct Fixture {
+        directory: PathBuf,
+        controller: AppController,
+    }
+
+    impl Fixture {
+        fn new(tag: &str) -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "ofm-concurrency-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|value| value.as_nanos())
+                    .unwrap_or(0)
+            ));
+            std::fs::create_dir_all(&directory).expect("create the temp directory");
+            let controller = AppController::with_directory(&directory);
+            ofm_i18n::set_language(AppLanguage::En);
+            Self {
+                directory,
+                controller,
+            }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    /// Run `body` on a worker thread and fail instead of hanging forever.
+    ///
+    /// Every method reaches for the `state` and `settings` locks, so a lock-order
+    /// regression shows up here as a timeout rather than as a wedged app.
+    fn within<T: Send + 'static>(seconds: u64, body: impl FnOnce() -> T + Send + 'static) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let value = body();
+            let _ = sender.send(value);
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(seconds))
+            .expect("the controller deadlocked")
+    }
+
+    #[test]
+    fn speak_does_not_re_enter_the_state_lock() {
+        let fixture = Fixture::new("speak");
+        fixture.controller.set_source_text("Hello");
+        let controller = fixture.controller.clone();
+        // `speak` reads the state to pick the text and the language; taking the
+        // same read lock twice used to deadlock here.
+        within(5, move || controller.speak("source"));
+        within(5, move || {
+            let controller = fixture.controller.clone();
+            controller.speak("translation");
+        });
+    }
+
+    #[test]
+    fn concurrent_commands_do_not_deadlock() {
+        let fixture = Fixture::new("parallel");
+        let controller = fixture.controller.clone();
+        let workers: Vec<_> = (0..4)
+            .map(|index| {
+                let controller = controller.clone();
+                std::thread::spawn(move || {
+                    for step in 0..40 {
+                        controller.set_source_text(&format!("text {index}-{step}"));
+                        controller.set_style(if step % 2 == 0 { "natural" } else { "auto" });
+                        controller.set_tone(if step % 3 == 0 { "formal" } else { "standard" });
+                        controller.set_source_language(if step % 2 == 0 { "auto" } else { "en" });
+                        controller.set_target_language(if step % 2 == 0 { "uk" } else { "de" });
+                        let _ = controller.state();
+                        controller.clear_source();
+                    }
+                })
+            })
+            .collect();
+
+        for worker in workers {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = worker.join();
+                let _ = sender.send(());
+            });
+            receiver
+                .recv_timeout(Duration::from_secs(20))
+                .expect("concurrent commands deadlocked");
+        }
+    }
+
+    #[test]
+    fn style_changes_reach_the_injected_settings_file() {
+        let fixture = Fixture::new("settings-path");
+        fixture.controller.set_style("natural");
+        fixture.controller.set_tone("formal");
+        let disk = std::fs::read_to_string(fixture.directory.join("settings.json"))
+            .expect("settings file");
+        assert!(disk.contains("natural"), "style not persisted: {disk}");
+        assert!(disk.contains("formal"), "tone not persisted: {disk}");
+    }
+
+    #[test]
+    fn an_empty_pane_is_not_served_from_the_cache() {
+        let fixture = Fixture::new("cache");
+        let controller = &fixture.controller;
+        let mut settings = controller.settings().clone();
+        settings.model = "hy-mt2:7b".to_string();
+        settings.auto_translate = false;
+        // Port 1 is closed, so the job fails immediately; the point is that it
+        // *starts* instead of being swallowed by the cache.
+        settings.base_url = "http://127.0.0.1:1".to_string();
+        controller.save_settings(settings);
+
+        controller.set_source_text("Hello");
+        controller.translate(true);
+        let first = controller.state_guard();
+        let started = first.is_translating;
+        drop(first);
+        assert!(started, "the first request must start");
+
+        controller.cancel();
+        controller.clear_source();
+        controller.set_source_text("Hello");
+        controller.translate(false);
+        let second = controller.state_guard();
+        assert!(
+            second.is_translating,
+            "a cleared pane must not be served from the cache"
+        );
     }
 }
