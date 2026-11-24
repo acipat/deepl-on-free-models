@@ -37,7 +37,8 @@ _RE_HY_TAIL = re.compile(r"[<｜|]\s*hy[-_/]?[A-Za-z]*[^>]*")
 _RE_OPEN_ANGLE = re.compile(r"<｜[^>]*$")
 _RE_OPEN_CLOSE = re.compile(r"</｜[^>]*$")
 _RE_TRAILING_HY = re.compile(r"｜hy[^\s]*$")
-_RE_TRAILING_BRACKET = re.compile(r"[<｜|]\s*$")
+# An ASCII pipe may close a Markdown table row.
+_RE_TRAILING_BRACKET = re.compile(r"[<｜]\s*$")
 
 
 # --------------------------------------------------------------------------- #
