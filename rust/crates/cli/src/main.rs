@@ -12,7 +12,7 @@ use ofm_config::{AppSettings, Provider};
 use ofm_docs::DocumentTranslator;
 use ofm_i18n::{t_in, AppLanguage, LanguageTable};
 use ofm_net::Translator;
-use ofm_text::{PromptBuilder, TranslationStyle, TranslationTone};
+use ofm_text::{TranslationStyle, TranslationTone};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -176,10 +176,12 @@ fn config_from(
 
     let mut config = settings.snapshot();
     config.kind = provider.kind();
-    config.base_url = conn
-        .base_url
-        .clone()
-        .unwrap_or_else(|| provider.base_url().to_string());
+    config.base_url = match conn.base_url.as_deref() {
+        Some(url) => url.to_string(),
+        // Without an override the stored endpoint wins; the provider default is
+        // only the last resort. The app remembers one URL per provider.
+        None => stored_base_url(settings, provider),
+    };
     if let Some(model) = &conn.model {
         config.model = model.clone();
     } else if provider != settings.provider {
@@ -196,6 +198,48 @@ fn config_from(
     });
     config.requires_api_key = provider.requires_key();
     Ok(config)
+}
+
+/// Stored base URL for `provider`; the provider default only when none exists.
+fn stored_base_url(settings: &AppSettings, provider: Provider) -> String {
+    let remembered = settings
+        .remembered
+        .get(&format!("base_url.{}", provider.value()))
+        .map(String::as_str);
+    let current = (provider == settings.provider).then_some(settings.base_url.as_str());
+    let candidate = current
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .or_else(|| remembered.map(str::trim).filter(|url| !url.is_empty()));
+    match candidate {
+        Some(url) => {
+            let mut value = url.to_string();
+            while value.ends_with('/') {
+                value.pop();
+            }
+            if value.is_empty() {
+                provider.base_url().to_string()
+            } else {
+                value
+            }
+        }
+        None => provider.base_url().to_string(),
+    }
+}
+
+/// Fallback configuration with its API key loaded from the secret store.
+///
+/// [`AppSettings::load`] never reads keys from disk, so a fallback provider
+/// that requires one would otherwise fail with `Unauthorized` before any
+/// request is sent.
+fn resolved_fallback(settings: &AppSettings) -> Option<ofm_config::BackendConfig> {
+    let mut fallback = settings.fallback_config()?;
+    if fallback.api_key.trim().is_empty() {
+        if let Some(key) = ofm_store_key(settings.fallback_provider) {
+            fallback.api_key = key;
+        }
+    }
+    Some(fallback)
 }
 
 /// API keys live in the secret store; the CLI reads them the same way the app does.
@@ -231,20 +275,22 @@ async fn translate(args: TextArgs) -> Result<(), String> {
         return Err("no model configured; pass --model or set one in the app".to_string());
     }
 
-    let source = if args.source == "auto" {
-        ofm_i18n::LanguageTable::detect(&text, settings.interface_language)
+    let (source, source_explicit) = if args.source == "auto" {
+        let detected = ofm_i18n::LanguageTable::detect(&text, settings.interface_language)
             .copied()
-            .unwrap_or(LanguageTable::AUTO)
+            .unwrap_or(LanguageTable::AUTO);
+        (detected, false)
     } else {
-        *language_or_die(&args.source)?
+        (*language_or_die(&args.source)?, true)
     };
     let target = language_or_die(&args.target)?;
 
     let translator = Translator::new();
-    let fallback = settings.fallback_config();
+    let fallback = resolved_fallback(&settings);
     let request = ofm_net::TranslateRequest {
         text: &text,
         source: &source,
+        source_explicit,
         target,
         style: style_from(&args.style),
         tone: tone_from(&args.tone),
@@ -291,6 +337,7 @@ async fn translate_file(args: FileArgs) -> Result<(), String> {
 
     let translator = Translator::new();
     let source = LanguageTable::AUTO;
+    let fallback = resolved_fallback(&settings);
     let mut failures: usize = 0;
 
     let written = DocumentTranslator::write(
@@ -300,11 +347,12 @@ async fn translate_file(args: FileArgs) -> Result<(), String> {
             let request = ofm_net::TranslateRequest {
                 text: paragraph,
                 source: &source,
+                source_explicit: false,
                 target,
                 style: TranslationStyle::Auto,
                 tone: TranslationTone::Standard,
                 config: &config,
-                fallback: None,
+                fallback: fallback.as_ref(),
                 cancel: None,
                 on_progress: None,
                 on_partial: None,
@@ -384,14 +432,34 @@ async fn check(args: ConnArgs) -> Result<(), String> {
 
 fn prompt(args: TextArgs) -> Result<(), String> {
     let text = read_text(args.text)?;
+    if text.trim().is_empty() {
+        return Err("nothing to translate".to_string());
+    }
+    let settings = AppSettings::load();
+    let config = config_from(&args.conn, &settings)?;
     let target = language_or_die(&args.target)?;
-    let instruction = PromptBuilder::instruction(
+    let (source, source_explicit) = if args.source == "auto" {
+        let detected = LanguageTable::detect(&text, settings.interface_language)
+            .copied()
+            .unwrap_or(LanguageTable::AUTO);
+        (detected, false)
+    } else {
+        (*language_or_die(&args.source)?, true)
+    };
+
+    // Use the translator's own selection, so the preview is exactly the first
+    // request body instead of a separately built instruction.
+    let prompt = ofm_net::first_prompt_for_text(
+        &text,
+        &source,
+        source_explicit,
+        target,
         style_from(&args.style),
         tone_from(&args.tone),
-        target.english_name,
-        false,
-    );
-    println!("{instruction}\n\n{text}");
+        &config.model,
+    )
+    .ok_or_else(|| "nothing to translate".to_string())?;
+    println!("{prompt}");
     Ok(())
 }
 

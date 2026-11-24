@@ -26,7 +26,7 @@ pub mod keycombo;
 pub mod providers;
 pub mod settings;
 
-pub use catalog::{CatalogEntry, ModelCatalog};
+pub use catalog::{CatalogEntry, ModelCatalog, PromptFamily};
 pub use keycombo::KeyCombo;
 pub use providers::{BackendConfig, BackendKind, Provider};
 pub use settings::AppSettings;

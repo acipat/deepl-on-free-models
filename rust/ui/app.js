@@ -571,6 +571,7 @@
       total: Math.max(0, Math.round(asNumber(pick(raw, ["total"], 0), 0))),
       percent: Math.max(0, Math.min(100, Math.round(asNumber(pick(raw, ["percent"], 0), 0)))),
       output: pick(raw, ["output"], null) || null,
+      savedPath: pick(raw, ["savedPath", "saved_path"], null) || null,
       resultName: pick(raw, ["resultName", "result_name"], null) || null,
       message: asString(pick(raw, ["message"], ""), ""),
       warnings: Math.max(0, Math.round(asNumber(pick(raw, ["warnings"], 0), 0))),
@@ -636,6 +637,8 @@
       speaking: "",
       hotkeyMessage: "",
       selectionHotkeyMessage: "",
+      loginItemStatus: "disabled",
+      loginItemError: null,
       fileJob: null,
       write: normalizeWrite(null),
       history: [],
@@ -707,6 +710,12 @@
       pick(raw, ["selectionHotkeyMessage", "selection_hotkey_message"], ""),
       ""
     );
+    // "Open at login" comes from the platform, not from the settings file.
+    state.loginItemStatus = asString(
+      pick(raw, ["loginItemStatus", "login_item_status"], "disabled"),
+      "disabled"
+    );
+    state.loginItemError = pick(raw, ["loginItemError", "login_item_error"], null) || null;
     state.fileJob = normalizeFileJob(pick(raw, ["fileJob", "file_job"], null));
     state.write = normalizeWrite(pick(raw, ["write"], null));
     state.history = normalizeHistory(pick(raw, ["history"], []));
@@ -766,6 +775,18 @@
     settingsSnapshot: null,
     settingsModelsSnapshot: null,
     settingsFallbackModelsSnapshot: null,
+    // The provider whose key each API-key field currently holds. Switching the
+    // provider moves the field to that provider's own key, so the text of the
+    // previous provider can never be saved under the new one.
+    settingsKeyProvider: null,
+    settingsFallbackKeyProvider: null,
+    settingsKeyDirty: false,
+    settingsFallbackKeyDirty: false,
+    // Provider whose stored key the shell still has to report after a switch.
+    settingsKeyAwaiting: null,
+    settingsFallbackKeyAwaiting: null,
+    primaryKeys: {},
+    fallbackKeys: {},
     diagnostics: null,
     settingsTab: "model",
     modelFilter: "",
@@ -1046,6 +1067,11 @@
       "debounceRange",
       "debounceValue",
       "keepHistoryToggle",
+      "loginItem",
+      "loginItemToggle",
+      "loginItemError",
+      "loginItemApproval",
+      "loginItemSettings",
       "warmUpToggle",
       "trayToggle",
       "interfaceLanguageSelect",
@@ -1394,8 +1420,10 @@
 
     const showProgress = translating;
     const showError = !translating && !!errorMessage && !hasResult;
-    const showResult = !translating && !showError && hasResult;
-    const showEmpty = !showProgress && !showError && !showResult;
+    // A streaming translation is painted while the progress bar stays visible;
+    // the text is a preview until the final result replaces it.
+    const showResult = hasResult && !showError;
+    const showEmpty = !translating && !showError && !hasResult;
 
     els.resultProgress.hidden = !showProgress;
     els.resultError.hidden = !showError;
@@ -1433,9 +1461,9 @@
     const copyUse = els.copyBtn.querySelector("use");
     if (copyUse) copyUse.setAttribute("href", copied ? "#i-check" : "#i-copy");
 
-    els.againBtn.disabled = translating || !state.sourceText.trim();
+    els.againBtn.disabled = !state.sourceText.trim();
     els.translateNowBtn.disabled = translating;
-    els.speakResultBtn.disabled = !hasResult;
+    els.speakResultBtn.disabled = !hasResult || translating;
     els.speakSourceBtn.disabled = !state.sourceText.trim() && !translating;
     els.copySourceBtn.disabled = !state.sourceText;
     els.clearSourceBtn.disabled = !state.sourceText;
@@ -1802,6 +1830,7 @@
       renderModels();
       renderFallbackModels();
       renderHotkeyMessages();
+      renderLoginItem();
       renderInstallHint();
       renderAboutDiagnostics();
       if (local.settingsDraft) updateProviderDetails(local.settingsDraft);
@@ -1817,6 +1846,7 @@
       local.settingsSnapshot = cloneSettings(state.settings);
       local.settingsModelsSnapshot = state.providerModels.slice();
       local.settingsFallbackModelsSnapshot = state.fallbackModels.slice();
+      rememberProviderKeys(state.settings);
       local.settingsDraft = cloneSettings(state.settings);
       local.modelFilter = "";
       els.modelFilter.value = "";
@@ -1975,6 +2005,16 @@
     );
     els.providerSelect.value = draft.provider;
     els.baseUrlInput.value = draft.baseUrl;
+    // Each key field starts on the provider it belongs to; `switchKeyField`
+    // moves it again whenever the provider changes in this dialog.
+    local.primaryKeys[draft.provider] = draft.apiKey || "";
+    local.fallbackKeys[draft.fallbackProvider] = draft.fallbackApiKey || "";
+    local.settingsKeyProvider = draft.provider;
+    local.settingsFallbackKeyProvider = draft.fallbackProvider;
+    local.settingsKeyDirty = false;
+    local.settingsFallbackKeyDirty = false;
+    local.settingsKeyAwaiting = null;
+    local.settingsFallbackKeyAwaiting = null;
     els.apiKeyInput.value = draft.apiKey;
     els.apiKeyInput.type = "password";
     els.revealKeyBtn.textContent = tr("Show");
@@ -2026,6 +2066,7 @@
     renderModels();
     renderFallbackModels();
     renderHotkeyMessages();
+    renderLoginItem();
     updateProviderDetails(draft);
     renderPromptChips();
     void refreshPromptPreview();
@@ -2062,6 +2103,112 @@
     } else {
       els.apiKeyHint.textContent = tr("Uses the stored key for this provider.");
     }
+  }
+
+  /* ------------------------------------------------------ provider API keys */
+
+  function keyField(kind) {
+    return kind === "fallback" ? els.fallbackKeyInput : els.apiKeyInput;
+  }
+
+  function keyCache(kind) {
+    return kind === "fallback" ? local.fallbackKeys : local.primaryKeys;
+  }
+
+  function keyOwner(kind) {
+    return kind === "fallback"
+      ? local.settingsFallbackKeyProvider
+      : local.settingsKeyProvider;
+  }
+
+  function setKeyOwner(kind, provider) {
+    if (kind === "fallback") local.settingsFallbackKeyProvider = provider;
+    else local.settingsKeyProvider = provider;
+  }
+
+  function keyDirty(kind) {
+    return kind === "fallback" ? local.settingsFallbackKeyDirty : local.settingsKeyDirty;
+  }
+
+  function setKeyDirty(kind, dirty) {
+    if (kind === "fallback") local.settingsFallbackKeyDirty = dirty;
+    else local.settingsKeyDirty = dirty;
+  }
+
+  function keyAwaiting(kind) {
+    return kind === "fallback"
+      ? local.settingsFallbackKeyAwaiting
+      : local.settingsKeyAwaiting;
+  }
+
+  function setKeyAwaiting(kind, provider) {
+    if (kind === "fallback") local.settingsFallbackKeyAwaiting = provider;
+    else local.settingsKeyAwaiting = provider;
+  }
+
+  /** Remember every provider's session key the shell has reported. */
+  function rememberProviderKeys(settings) {
+    if (!settings || typeof settings !== "object") return;
+    if (settings.provider) local.primaryKeys[settings.provider] = settings.apiKey || "";
+    if (settings.fallbackProvider) {
+      local.fallbackKeys[settings.fallbackProvider] = settings.fallbackApiKey || "";
+    }
+  }
+
+  /**
+   * Move a key field to `provider`'s own key.
+   *
+   * The text typed for the previous provider stays under that provider; a
+   * provider with no known key shows an empty field, and the controller loads
+   * that provider's stored key when the dialog is saved. This is what stops a
+   * catalogue click from saving an OpenRouter key as a Groq key.
+   */
+  function switchKeyField(kind, provider) {
+    const field = keyField(kind);
+    if (!field || !provider) return;
+    const cache = keyCache(kind);
+    const owner = keyOwner(kind);
+    if (owner && keyDirty(kind)) cache[owner] = field.value;
+    const known = Object.prototype.hasOwnProperty.call(cache, provider);
+    const value = known ? cache[provider] : "";
+    field.value = value;
+    setKeyOwner(kind, provider);
+    setKeyDirty(kind, false);
+    // An unknown provider's stored key arrives with the next settings payload;
+    // until then the field stays empty instead of showing another key.
+    setKeyAwaiting(kind, known ? null : provider);
+    const draft = local.settingsDraft;
+    if (draft) {
+      if (kind === "fallback") draft.fallbackApiKey = value;
+      else draft.apiKey = value;
+    }
+  }
+
+  /**
+   * Refresh a key field from a settings payload (catalogue or state event).
+   *
+   * Never overwrites text the user typed for the provider on screen; it fills
+   * the field that `switchKeyField` emptied for a newly selected provider.
+   */
+  function refreshKeyField(kind, provider, key) {
+    if (!provider) return;
+    keyCache(kind)[provider] = key || "";
+    const draft = local.settingsDraft;
+    if (!draft) return;
+    const draftProvider = kind === "fallback" ? draft.fallbackProvider : draft.provider;
+    if (draftProvider !== provider) return;
+    if (keyDirty(kind) && keyOwner(kind) === provider) return;
+    // A field that already holds this provider's key keeps it; only the field
+    // emptied by a provider switch is filled from the payload.
+    if (keyOwner(kind) === provider && keyAwaiting(kind) !== provider) return;
+    const field = keyField(kind);
+    if (!field) return;
+    field.value = key || "";
+    setKeyOwner(kind, provider);
+    setKeyDirty(kind, false);
+    setKeyAwaiting(kind, null);
+    if (kind === "fallback") draft.fallbackApiKey = key || "";
+    else draft.apiKey = key || "";
   }
 
   function setRange(range, output, value, format) {
@@ -2286,6 +2433,56 @@
     apply(els.selectionHotkeyMessage, state.selectionHotkeyMessage);
   }
 
+  /* ------------------------------------------------------------ login item */
+
+  function renderLoginItem() {
+    if (!els.loginItem) return;
+    // Platforms without login items hide the whole row, like the Python port.
+    const status = state.loginItemStatus || "disabled";
+    const supported = status !== "unsupported";
+    els.loginItem.hidden = !supported;
+    if (!supported) return;
+    els.loginItemToggle.checked = status === "enabled";
+    const error = state.loginItemError || "";
+    els.loginItemError.hidden = !error;
+    els.loginItemError.textContent = error;
+    // macOS asks the user to approve the item in System Settings.
+    els.loginItemApproval.hidden = status !== "requiresApproval";
+  }
+
+  /** Read the authoritative status back after a change. */
+  async function refreshLoginItem() {
+    try {
+      const value = await invoke("get_login_item");
+      if (value && typeof value === "object") {
+        state.loginItemStatus = String(value.status || "disabled");
+        state.loginItemError = value.error ? String(value.error) : null;
+      }
+    } catch (error) {
+      /* the state snapshot still carries both fields */
+    }
+    renderLoginItem();
+  }
+
+  async function setLoginItem(enabled) {
+    if (!els.loginItem) return;
+    if (state.loginItemStatus === "requiresApproval") {
+      // The system still needs the user's approval, so there is nothing to
+      // toggle here: send them to the page that grants it.
+      renderLoginItem();
+      send("open_login_item_settings");
+      return;
+    }
+    els.loginItemError.hidden = true;
+    els.loginItemError.textContent = "";
+    try {
+      await invoke("set_login_item", { enabled: enabled });
+    } catch (error) {
+      showToast(errorText(error));
+    }
+    await refreshLoginItem();
+  }
+
   function renderPromptChips() {
     setSegment(els.promptStyleChips, "style", local.promptStyle);
     setSegment(els.promptToneChips, "tone", local.promptTone);
@@ -2355,12 +2552,18 @@
     const draft = local.settingsDraft || cloneSettings(state.settings);
     draft.provider = els.providerSelect.value;
     draft.baseUrl = els.baseUrlInput.value.trim();
-    draft.apiKey = els.apiKeyInput.value;
+    // Only send a key the field still holds for the selected provider; a stale
+    // text left over from another provider must never reach the controller.
+    draft.apiKey =
+      local.settingsKeyProvider === draft.provider ? els.apiKeyInput.value : "";
     draft.model = els.modelInput.value.trim();
     draft.fallbackEnabled = els.fallbackToggle.checked;
     draft.fallbackProvider = els.fallbackProviderSelect.value;
     draft.fallbackBaseUrl = els.fallbackBaseInput.value.trim();
-    draft.fallbackApiKey = els.fallbackKeyInput.value;
+    draft.fallbackApiKey =
+      local.settingsFallbackKeyProvider === draft.fallbackProvider
+        ? els.fallbackKeyInput.value
+        : "";
     draft.fallbackModel = els.fallbackModelInput.value.trim();
     draft.temperature = Number(els.temperatureRange.value);
     draft.topP = Number(els.topPRange.value);
@@ -2671,6 +2874,9 @@
           ensureSelectOption(els.providerSelect, provider, info.title);
           els.providerSelect.value = provider;
           els.baseUrlInput.value = info.baseUrl;
+          // The applied provider's key replaces the previous provider's text;
+          // the settings event that follows carries the stored key.
+          switchKeyField("primary", provider);
         }
         els.modelInput.value = modelId;
         updateProviderDetails(draft);
@@ -2934,9 +3140,54 @@
   function revealFile() {
     const job = state.fileJob;
     if (!job) return;
-    const path = job.output || job.path;
+    // Prefer the saved file once it exists; before the first save the staged
+    // copy is the only file there is.
+    const path = job.savedPath || job.output || job.path;
     if (!path) return;
     send("reveal_in_folder", { path: path });
+  }
+
+  /**
+   * Replace the Write draft through the same path as typing or pasting it.
+   *
+   * The counter, the button states, the stale-result reset and the cancel of an
+   * older rewrite all follow from one place, so `--write-text` and a pasted
+   * draft cannot drift apart.
+   */
+  function setWriteDraft(text, options) {
+    const value = text === null || text === undefined ? "" : String(text);
+    local.writeText = value;
+    if (els.writeInput.value !== value) els.writeInput.value = value;
+    els.writeCounter.textContent = value ? characters(Array.from(value).length) : "";
+    els.improveBtn.disabled = !value.trim() || state.write.running;
+    els.clearWriteBtn.disabled = !value;
+    // Editing invalidates the previous result: Copy must never return text for
+    // an older draft. Stop any rewrite still in flight.
+    const active = !!(
+      state.write.running ||
+      local.writeBusy ||
+      state.write.output ||
+      state.write.error
+    );
+    if (active) {
+      local.writeStale = true;
+      local.writePending = false;
+      local.writeSawRunning = false;
+      local.writeBusy = false;
+      state.write.running = false;
+      if (!local.writeCancelSent) {
+        local.writeCancelSent = true;
+        send("cancel_write");
+      }
+    }
+    if (options && options.focus) {
+      try {
+        els.writeInput.focus({ preventScroll: true });
+      } catch (error) {
+        els.writeInput.focus();
+      }
+    }
+    renderWrite();
   }
 
   function improveText() {
@@ -3204,6 +3455,12 @@
         state.errorMessage = null;
         renderTranslate();
         return;
+      case "translationpartial":
+        // Streaming preview: keep the progress bar and the final-result rules
+        // (history, metrics, warnings) untouched.
+        if (value !== undefined && value !== null) state.translatedText = String(value);
+        renderTranslate();
+        return;
       case "sourcetext":
         if (value !== undefined && value !== null) state.sourceText = String(value);
         renderTranslate();
@@ -3275,6 +3532,21 @@
         if (value && typeof value === "object") {
           const language = state.settings.interfaceLanguage;
           state.settings = normalizeSettings(value);
+          rememberProviderKeys(state.settings);
+          if (local.settingsDraft) {
+            // The catalogue changes the provider outside the form; move the key
+            // fields with it and fill them from the provider's stored key.
+            refreshKeyField(
+              "primary",
+              state.settings.provider,
+              state.settings.apiKey
+            );
+            refreshKeyField(
+              "fallback",
+              state.settings.fallbackProvider,
+              state.settings.fallbackApiKey
+            );
+          }
           if (state.settings.interfaceLanguage !== language) void refreshCatalogue();
           render();
         } else {
@@ -3291,6 +3563,15 @@
       case "tab":
         state.tab = value !== undefined && value !== null ? String(value) : state.tab;
         renderTabs();
+        return;
+      case "loginitem":
+        state.loginItemStatus =
+          value !== undefined && value !== null ? String(value) : state.loginItemStatus;
+        if (els.settingsDialog.open) {
+          renderLoginItem();
+          // The event carries the status only; the error text lives in state.
+          void refreshLoginItem();
+        }
         return;
       case "history":
         local.historyResults = null;
@@ -3538,32 +3819,7 @@
 
     // Write ---------------------------------------------------------------
     els.writeInput.addEventListener("input", () => {
-      local.writeText = els.writeInput.value;
-      els.writeCounter.textContent = local.writeText
-        ? characters(Array.from(local.writeText).length)
-        : "";
-      els.improveBtn.disabled = !local.writeText.trim() || state.write.running;
-      els.clearWriteBtn.disabled = !local.writeText;
-      // Editing invalidates the previous result: Copy must never return text
-      // for an older draft. Stop any rewrite still in flight.
-      const active = !!(
-        state.write.running ||
-        local.writeBusy ||
-        state.write.output ||
-        state.write.error
-      );
-      if (active) {
-        local.writeStale = true;
-        local.writePending = false;
-        local.writeSawRunning = false;
-        local.writeBusy = false;
-        state.write.running = false;
-        if (!local.writeCancelSent) {
-          local.writeCancelSent = true;
-          send("cancel_write");
-        }
-      }
-      renderWrite();
+      setWriteDraft(els.writeInput.value);
     });
     // Ctrl+Enter is handled once by the delegated document handler below.
     els.writeTarget.addEventListener("change", () => {
@@ -3801,6 +4057,8 @@
       }
       local.settingsDraft.provider = next;
       local.settingsDraft.baseUrl = els.baseUrlInput.value.trim();
+      // The API key belongs to the provider it was issued for.
+      switchKeyField("primary", next);
       updateProviderDetails(local.settingsDraft);
       renderModels();
     });
@@ -3808,6 +4066,7 @@
       if (local.settingsDraft) local.settingsDraft.baseUrl = els.baseUrlInput.value.trim();
     });
     els.apiKeyInput.addEventListener("input", () => {
+      local.settingsKeyDirty = true;
       if (local.settingsDraft) local.settingsDraft.apiKey = els.apiKeyInput.value;
     });
     els.modelInput.addEventListener("input", () => {
@@ -3859,11 +4118,15 @@
       }
       local.settingsDraft.fallbackProvider = next;
       local.settingsDraft.fallbackBaseUrl = els.fallbackBaseInput.value.trim();
+      // The fallback key has the same rule: it is the new provider's key, never
+      // the previous provider's text.
+      switchKeyField("fallback", next);
     });
     els.fallbackBaseInput.addEventListener("input", () => {
       if (local.settingsDraft) local.settingsDraft.fallbackBaseUrl = els.fallbackBaseInput.value.trim();
     });
     els.fallbackKeyInput.addEventListener("input", () => {
+      local.settingsFallbackKeyDirty = true;
       if (local.settingsDraft) local.settingsDraft.fallbackApiKey = els.fallbackKeyInput.value;
     });
     els.fallbackModelInput.addEventListener("input", () => {
@@ -3895,6 +4158,12 @@
     });
     els.keepHistoryToggle.addEventListener("change", () => {
       if (local.settingsDraft) local.settingsDraft.keepHistory = els.keepHistoryToggle.checked;
+    });
+    els.loginItemToggle.addEventListener("change", () => {
+      void setLoginItem(els.loginItemToggle.checked);
+    });
+    els.loginItemSettings.addEventListener("click", () => {
+      send("open_login_item_settings");
     });
     els.warmUpToggle.addEventListener("change", () => {
       if (local.settingsDraft) local.settingsDraft.warmUpOnLaunch = els.warmUpToggle.checked;
@@ -4018,16 +4287,14 @@
     }
     if (!startup || typeof startup !== "object") return;
     if (startup.catalog) openCatalog();
-    if (startup.writeText !== undefined && startup.writeText !== null) {
-      local.writeText = String(startup.writeText);
-      els.writeInput.value = local.writeText;
+    if (typeof startup.writeText === "string" && startup.writeText.length > 0) {
+      // A draft given on the command line takes the same path as a pasted one:
+      // the stale-result reset, the cancellation of an older rewrite and the
+      // "detect the draft's language" default all run.
       local.writeTargetChosen = false;
       local.writeTarget = "";
-      // A pre-filled draft is not the draft the previous WriteState describes.
-      if (state.write.output || state.write.error || state.write.running) {
-        local.writeStale = true;
-      }
       selectTab("write");
+      setWriteDraft(startup.writeText, { focus: true });
     }
     if (startup.tab && TABS.includes(String(startup.tab))) {
       selectTab(String(startup.tab));

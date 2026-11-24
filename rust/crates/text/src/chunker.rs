@@ -27,6 +27,14 @@ const SENTENCE_TERMINATORS: [char; 7] = [
 /// Characters that may trail a terminator without breaking the sentence.
 const CLOSING_CHARACTERS: [char; 7] = ['"', '\'', '\u{201D}', '\u{2019}', '\u{00BB}', ')', ']'];
 
+/// Longest plain-text line still recognised as a heading.
+///
+/// The old rule treated every block up to 80 characters as a heading, which
+/// swallowed a short question and the selected style/tone with it. Only a line
+/// that also looks like a title (no terminal punctuation, capitalised) keeps
+/// the heading prompt now.
+const PLAIN_HEADING_LIMIT: usize = 80;
+
 /// Common abbreviations whose period does not end a sentence.
 const ABBREVIATIONS: [&str; 22] = [
     "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs", "etc", "fig", "figs", "no", "vol",
@@ -389,7 +397,48 @@ fn parse_prefix(line: &str) -> (String, String, bool) {
         let is_heading = prefix.trim_start().starts_with('#');
         return (prefix.to_string(), body.to_string(), is_heading);
     }
-    (String::new(), line.to_string(), false)
+    (String::new(), line.to_string(), looks_like_heading(line))
+}
+
+/// True when an unprefixed line is structurally a heading.
+///
+/// A heading is short, has no terminal punctuation and starts every word with
+/// a capitalised (or caseless, e.g. CJK) letter. A question such as
+/// `Could you send me the report?` therefore stays a normal block and keeps the
+/// user's style and tone.
+fn looks_like_heading(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > PLAIN_HEADING_LIMIT {
+        return false;
+    }
+    if ends_with_terminal_punctuation(trimmed) {
+        return false;
+    }
+    let mut has_letter = false;
+    for word in trimmed.split_whitespace() {
+        let Some(first) = word.chars().find(|character| character.is_alphabetic()) else {
+            continue;
+        };
+        has_letter = true;
+        if first.is_lowercase() {
+            return false;
+        }
+    }
+    has_letter
+}
+
+/// True when `text` ends with sentence punctuation, ignoring closing quotes.
+fn ends_with_terminal_punctuation(text: &str) -> bool {
+    let mut characters = text.chars().rev().peekable();
+    while characters
+        .peek()
+        .is_some_and(|character| CLOSING_CHARACTERS.contains(character))
+    {
+        characters.next();
+    }
+    characters
+        .next()
+        .is_some_and(|character| SENTENCE_TERMINATORS.contains(&character))
 }
 
 /// Split an over-long line by sentences, then by raw length (Swift logic).
@@ -515,6 +564,45 @@ mod tests {
             TextChunker::normalize(&TextChunker::normalize(value)),
             "One\nTwo\nThree\nFour"
         );
+    }
+
+    #[test]
+    fn short_questions_are_not_headings() {
+        for text in [
+            "Could you send me the report?",
+            "Could you send me the report",
+            "Is this ready?!",
+            "Why\u{2026}",
+        ] {
+            let chunks = TextChunker::split(text);
+            assert!(!chunks[0].is_heading, "{text:?} must stay a normal block");
+        }
+    }
+
+    #[test]
+    fn markdown_and_title_like_lines_are_headings() {
+        for text in [
+            "# Title",
+            "## Section",
+            "Introduction",
+            "Report Summary",
+            "  Overview",
+        ] {
+            let chunks = TextChunker::split(text);
+            assert!(chunks[0].is_heading, "{text:?} must be a heading");
+        }
+        // Lists and quotes keep their own prefixes and are never headings.
+        for text in ["- item", "1. step", "> quote", "lowercase fragment"] {
+            let chunks = TextChunker::split(text);
+            assert!(!chunks[0].is_heading, "{text:?} must not be a heading");
+        }
+    }
+
+    #[test]
+    fn long_title_like_lines_are_not_headings() {
+        let text = "Word ".repeat(20);
+        let chunks = TextChunker::split(&text);
+        assert!(!chunks[0].is_heading);
     }
 
     #[test]

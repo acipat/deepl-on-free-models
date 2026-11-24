@@ -387,6 +387,9 @@ pub type CancelFlag = Arc<std::sync::atomic::AtomicBool>;
 pub struct TranslateRequest<'a> {
     pub text: &'a str,
     pub source: &'a ofm_i18n::Language,
+    /// True when the user *chose* the source language rather than the detector
+    /// guessing it; only then does the prompt assert "The source language is …".
+    pub source_explicit: bool,
     pub target: &'a ofm_i18n::Language,
     pub style: TranslationStyle,
     pub tone: TranslationTone,
@@ -606,6 +609,10 @@ pub struct AppState {           // plain snapshot handed to the UI as JSON
     pub write: WriteState,
     pub history: Vec<HistoryEntry>,
     pub history_error: bool,
+    /// Login-item state: `enabled`, `disabled`, `requiresApproval`, `unsupported`.
+    pub login_item_status: String,
+    /// Why the login item could not be changed, localised.
+    pub login_item_error: Option<String>,
     pub settings: AppSettings,
     pub version: String,
 }
@@ -617,6 +624,9 @@ pub struct FileJob {
     pub output: Option<String>, pub result_name: Option<String>,
     pub message: Option<String>, pub warnings: usize,
     pub fallback: bool, pub fallback_label: String, pub save_error: Option<String>,
+    /// Where the user last saved the result; the staged file remains the source
+    /// of truth, so a second save always copies the staged output.
+    pub saved_path: Option<String>,
 }
 
 /// `AppEvent` is serialised with `#[serde(tag = "type", rename_all = "camelCase")]`
@@ -655,6 +665,8 @@ pub enum AppEvent {   // every variant is mirrored to the frontend as JSON
     Style(String),
     Tone(String),
     ResultView(String),
+    /// Streamed text that is not final yet.
+    TranslationPartial(String),
 }
 
 pub struct AppController { /* … */ }

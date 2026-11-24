@@ -1,9 +1,15 @@
 //! Translation prompts and their UI metadata.
 //!
 //! Port of `windows/deepl_ofm/core/prompts.py`, which is itself a port of
-//! `Sources/HyMT/Models/Prompt.swift`. The instruction strings are
+//! `Sources/HyMT/Models/Prompt.swift`. The Hy-MT2 instruction strings are
 //! byte-for-byte identical to the macOS app because Hy-MT2 was trained on this
 //! exact wording; do not "fix" the grammar or the spacing.
+//!
+//! TranslateGemma publishes a different instruction (both language names and
+//! codes). It is kept in [`PromptBuilder::translate_gemma_prompt`] and never
+//! mixed into the Hy-MT2 strings.
+
+use ofm_i18n::Language;
 
 /// Markdown clause appended to the instruction when Markdown is preserved.
 ///
@@ -253,6 +259,37 @@ impl PromptBuilder {
         value
     }
 
+    /// TranslateGemma instruction, using both language names and codes.
+    ///
+    /// Published by the model card:
+    /// <https://ollama.com/library/translategemma#prompt-guide>. The card asks
+    /// for two blank lines before the text and has no style or tone variants,
+    /// so this wording is used verbatim and must not be reused for Hy-MT2.
+    pub fn translate_gemma_instruction(source: &Language, target: &Language) -> String {
+        let source_name = source.english_name;
+        let source_code = source.code;
+        let target_name = target.english_name;
+        let target_code = target.code;
+        format!(
+            "You are a professional {source_name} ({source_code}) to {target_name} \
+             ({target_code}) translator. Your goal is to accurately convey the meaning and \
+             nuances of the original {source_name} text while adhering to {target_name} \
+             grammar, vocabulary, and cultural sensitivities.\n\
+             Produce only the {target_name} translation, without any additional explanations \
+             or commentary. Please translate the following {source_name} text into \
+             {target_name}:"
+        )
+    }
+
+    /// TranslateGemma instruction, two blank lines, then `text`.
+    pub fn translate_gemma_prompt(text: &str, source: &Language, target: &Language) -> String {
+        let mut value = Self::translate_gemma_instruction(source, target);
+        // The model card requires *two blank lines* before the text.
+        value.push_str("\n\n\n");
+        value.push_str(text);
+        value
+    }
+
     /// Example prompt shown in Settings (no Markdown clause, like Swift).
     pub fn preview(
         style: TranslationStyle,
@@ -270,6 +307,7 @@ impl PromptBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ofm_i18n::LanguageTable;
 
     fn auto_standard(target: &str) -> String {
         PromptBuilder::instruction(
@@ -517,6 +555,30 @@ mod tests {
         );
         assert!(preview.ends_with("\n\nHello, world!"));
         assert!(!preview.contains("Preserve Markdown"));
+    }
+
+    #[test]
+    fn translate_gemma_instruction_matches_the_model_card() {
+        let english = LanguageTable::get("en").expect("en");
+        let german = LanguageTable::get("de").expect("de");
+        assert_eq!(
+            PromptBuilder::translate_gemma_instruction(english, german),
+            "You are a professional English (en) to German (de) translator. Your goal is \
+             to accurately convey the meaning and nuances of the original English text \
+             while adhering to German grammar, vocabulary, and cultural sensitivities.\n\
+             Produce only the German translation, without any additional explanations or \
+             commentary. Please translate the following English text into German:"
+        );
+    }
+
+    #[test]
+    fn translate_gemma_prompt_has_two_blank_lines_before_the_text() {
+        let english = LanguageTable::get("en").expect("en");
+        let german = LanguageTable::get("de").expect("de");
+        let prompt = PromptBuilder::translate_gemma_prompt("Hello, world!", english, german);
+        assert!(prompt.ends_with("\n\n\nHello, world!"));
+        assert!(prompt.contains("You are a professional English (en) to German (de) translator."));
+        assert!(prompt.contains("Please translate the following English text into German:"));
     }
 
     #[test]

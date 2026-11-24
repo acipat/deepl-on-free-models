@@ -97,8 +97,14 @@ pub struct FileJob {
     /// 0–100, derived from `completed`/`total`.
     pub percent: u32,
     /// Staged output file (valid when `state == "done"`).
+    ///
+    /// This is the immutable working copy inside the staging folder and stays
+    /// the source of every "Save as", so a second save never copies the first
+    /// destination (which may have been moved or edited in the meantime).
     pub output: Option<String>,
-    /// File name of the staged output.
+    /// Where the user last saved the result, when it was saved.
+    pub saved_path: Option<String>,
+    /// Suggested file name for the next "Save as".
     pub result_name: Option<String>,
     /// Localised failure message.
     pub message: Option<String>,
@@ -305,6 +311,12 @@ pub enum AppEvent {
         /// The new translation.
         value: String,
     },
+    /// A streaming translation arrived; the job is still running and this is
+    /// not a final result (history, metrics and warnings wait for it).
+    TranslationPartial {
+        /// The translated text accumulated so far.
+        value: String,
+    },
     /// The source text changed.
     SourceText {
         /// The new source text.
@@ -455,6 +467,9 @@ mod tests {
             AppEvent::Translating { value: true },
             AppEvent::TranslatedText {
                 value: "text".to_string(),
+            },
+            AppEvent::TranslationPartial {
+                value: "partial".to_string(),
             },
             AppEvent::SourceText {
                 value: "source".to_string(),

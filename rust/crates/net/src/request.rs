@@ -29,6 +29,12 @@ pub struct TranslateRequest<'a> {
     /// Source language (`LanguageTable::AUTO` when the caller did not detect
     /// one).
     pub source: &'a Language,
+    /// Whether the user explicitly chose [`Self::source`].
+    ///
+    /// A detected language is only a guess (Arabic script does not imply
+    /// Arabic), so the model is told the source language only when this flag is
+    /// true. `false` also covers `LanguageTable::AUTO`.
+    pub source_explicit: bool,
     /// Target language.
     pub target: &'a Language,
     /// How freely the model may paraphrase.

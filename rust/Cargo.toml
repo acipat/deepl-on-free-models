@@ -38,3 +38,14 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Debug builds are for agents and tests, not for humans: with full debug info
+# target/ passed 10 GiB and filled a 436 GiB disk. debug = 0 keeps symbols out
+# of rlibs and test binaries; strip is a no-op then but states the intent.
+[profile.dev]
+debug = 0
+strip = "debuginfo"
+
+# Dependencies are the bulk of the tree; they need no line tables either.
+[profile.dev.package."*"]
+debug = 0

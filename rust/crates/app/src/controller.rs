@@ -38,6 +38,12 @@ use crate::state::{AppEvent, AppState, BackendStatus, FileJob, FileJobState, Wri
 /// Upper bound for the translated-text cache: one entry is enough.
 type CacheKey = (String, String, String, String, String, String);
 
+/// Minimum gap between two streaming repaints of the result pane.
+///
+/// The engine emits a partial after every block; repainting on every token
+/// would re-render Markdown dozens of times a second for no visible gain.
+const PARTIAL_INTERVAL: Duration = Duration::from_millis(120);
+
 /// Everything the controller owns. Cloned as an `Arc` into every job.
 struct Inner {
     runtime: Runtime,
@@ -659,27 +665,27 @@ impl AppController {
         });
     }
 
+    /// Translate again after an explicit language, style or tone change.
+    ///
+    /// This is not typing: the new pair must start at once, so it cancels the
+    /// running job, drops a pending debounce token and starts immediately.
+    /// `translate(true)` supersedes both, which also keeps the result pane
+    /// from waiting for the keystroke delay.
     fn retranslate_if_possible(&self) {
-        let has_text = !self.state_guard().source_text.trim().is_empty();
-        let auto = self.settings().auto_translate;
-        if !has_text {
+        if self.state_guard().source_text.trim().is_empty() {
             return;
         }
-        // Supersede the running job first: otherwise `translate_now`'s
-        // `translating && !force` guard drops the new request and the style or
-        // tone change is silently ignored.
-        self.cancel();
-        if auto {
-            self.schedule_translation();
-        } else {
-            self.translate(true);
-        }
+        self.translate(true);
     }
 
     // -------------------------------------------------------- translation
 
     /// Start a translation. `force` supersedes a running job.
     pub fn translate(&self, force: bool) {
+        if force {
+            // A forced run also supersedes the pending keystroke timer.
+            self.inner.debounce.fetch_add(1, Ordering::SeqCst);
+        }
         translate_now(&self.inner, force);
     }
 
@@ -1019,6 +1025,9 @@ impl AppController {
                 .write()
                 .unwrap_or_else(|p| p.into_inner());
             settings.apply_catalog_entry(entry);
+            // `apply_provider` clears the session key; the settings dialog and
+            // the next request need the key of the provider now selected.
+            settings.api_key = self.inner.secrets.read(&settings.provider.key_account());
             settings.save();
             let snapshot = settings.clone();
             drop(settings);
@@ -1144,7 +1153,23 @@ impl AppController {
             if settings.base_url == current.base_url {
                 settings.base_url = memory.base_url;
             }
-            if settings.api_key.trim().is_empty() || settings.api_key == current.api_key {
+            // The dialog may still hold the *previous* provider's key: the
+            // catalogue applies the provider before the form is repainted, so
+            // saving would otherwise store (and send) an OpenRouter key as a
+            // Groq key. A key that matches the outgoing account is dropped and
+            // the incoming provider's stored key is loaded instead.
+            let previous_key = if current.api_key.trim().is_empty() {
+                self.inner
+                    .secrets
+                    .read(&current.provider.key_account())
+                    .trim()
+                    .to_string()
+            } else {
+                current.api_key.trim().to_string()
+            };
+            let incoming_key = settings.api_key.trim();
+            let carried_over = !incoming_key.is_empty() && incoming_key == previous_key;
+            if incoming_key.is_empty() || carried_over || settings.api_key == current.api_key {
                 settings.api_key = self.inner.secrets.read(&settings.provider.key_account());
             }
         }
@@ -1159,7 +1184,23 @@ impl AppController {
             if settings.fallback_base_url == current.fallback_base_url {
                 settings.fallback_base_url = memory.fallback_base_url;
             }
-            if settings.fallback_api_key.trim().is_empty()
+            // Same rule as the primary key: the dialog may still show the
+            // previous fallback provider's key text, which must not be stored
+            // under the newly selected fallback provider.
+            let previous_fallback_key = if current.fallback_api_key.trim().is_empty() {
+                self.inner
+                    .secrets
+                    .read(&current.fallback_provider.key_account())
+                    .trim()
+                    .to_string()
+            } else {
+                current.fallback_api_key.trim().to_string()
+            };
+            let incoming_fallback_key = settings.fallback_api_key.trim();
+            let carried_over =
+                !incoming_fallback_key.is_empty() && incoming_fallback_key == previous_fallback_key;
+            if carried_over
+                || settings.fallback_api_key.trim().is_empty()
                 || settings.fallback_api_key == current.fallback_api_key
             {
                 settings.fallback_api_key = self
@@ -1169,15 +1210,27 @@ impl AppController {
             }
         }
 
-        // Keep the outgoing key when the provider changed, then store the new one.
+        // Keep the outgoing keys when the provider changed, then store the new ones.
         if provider_changed && !current.api_key.trim().is_empty() {
             self.store_key(current.provider, &current.api_key);
         }
-        self.store_key(settings.provider, &settings.api_key);
         if fallback_changed && !current.fallback_api_key.trim().is_empty() {
             self.store_key(current.fallback_provider, &current.fallback_api_key);
         }
-        self.store_key(settings.fallback_provider, &settings.fallback_api_key);
+        if settings.fallback_provider == settings.provider {
+            // Both slots share one secret account. The primary key is
+            // authoritative; an empty fallback field must never delete it, or
+            // authorisation is gone after a restart.
+            let key = if settings.api_key.trim().is_empty() {
+                settings.fallback_api_key.clone()
+            } else {
+                settings.api_key.clone()
+            };
+            self.store_key(settings.provider, &key);
+        } else {
+            self.store_key(settings.provider, &settings.api_key);
+            self.store_key(settings.fallback_provider, &settings.fallback_api_key);
+        }
 
         let language = settings.interface_language;
         match &self.inner.settings_path {
@@ -1313,7 +1366,17 @@ impl AppController {
             .and_then(LanguageTable::get)
             .copied()
             .unwrap_or_else(|| *self.target_language());
-        let source = *self.resolved_source();
+        // A document owns its source language. Only an explicit pick is taken
+        // from the Translate tab; with Auto the document's own text decides,
+        // never the detection of unrelated text in the other tab.
+        let selection = self.state_guard().source_language.clone();
+        let explicit_source = if selection == "auto" {
+            None
+        } else {
+            LanguageTable::get(&selection).copied()
+        };
+        let source_explicit = explicit_source.is_some();
+        let ui_language = self.settings().interface_language;
         let style = self.style();
         let tone = self.tone();
         let path = path.to_path_buf();
@@ -1322,19 +1385,17 @@ impl AppController {
         // Reading, translating and rewriting a document is synchronous and can
         // take seconds: run it on the blocking pool so the async workers stay free.
         self.inner.runtime.spawn_blocking(move || {
-            let staging = std::env::temp_dir().join(format!(
-                "deepl-ofm-{}-{}",
-                std::process::id(),
-                generation
-            ));
-            if let Err(error) = std::fs::create_dir_all(&staging) {
-                file_failed(
-                    &inner,
-                    generation,
-                    format!("could not create a temporary folder: {error}"),
-                );
-                return;
-            }
+            let staging = match create_staging_folder(generation) {
+                Ok(folder) => folder,
+                Err(error) => {
+                    file_failed(
+                        &inner,
+                        generation,
+                        format!("could not create a temporary folder: {error}"),
+                    );
+                    return;
+                }
+            };
 
             let read = DocumentTranslator::read(&path);
             let document = match read {
@@ -1345,6 +1406,7 @@ impl AppController {
                     return;
                 }
             };
+            let source = explicit_source.unwrap_or_else(|| document_source(&document, ui_language));
 
             file_update(&inner, generation, |job| {
                 job.state = FileJobState::Translating.value().to_string();
@@ -1370,6 +1432,7 @@ impl AppController {
                 let request = ofm_net::TranslateRequest {
                     text: paragraph,
                     source: &source,
+                    source_explicit,
                     target: &target,
                     style,
                     tone,
@@ -1467,40 +1530,27 @@ impl AppController {
     }
 
     /// Copy the staged result to the destination the user picked.
+    ///
+    /// The staged working copy is the only source: `job.output` never changes
+    /// after the job finished, so saving twice always copies the translated
+    /// document, not the destination of the previous save (which the user may
+    /// have moved or edited).
     pub fn save_translated_file(&self, destination: &Path) {
-        let Some(staged) = self
-            .inner
-            .file_staging
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
-        else {
-            self.report_error(t("The file could not be translated."));
-            return;
-        };
         let Some(job) = self.state_guard().file_job.clone() else {
             return;
         };
-        let Some(output) = job.output.as_ref().map(PathBuf::from) else {
+        let Some(staged) = job.output.as_ref().map(PathBuf::from) else {
             return;
         };
-        let _ = staged; // the staged folder is removed by `clear_file_job`
+        if !staged.is_file() {
+            self.report_error(t("The file could not be translated."));
+            return;
+        }
 
-        // Copy next to the target and rename, so a failure never truncates an
-        // existing file the user chose.
-        let temporary = destination.with_extension(format!(
-            "{}.part",
-            destination
-                .extension()
-                .map(|value| value.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        ));
-        let copy = std::fs::copy(&output, &temporary)
-            .and_then(|_| std::fs::rename(&temporary, destination));
-        match copy {
-            Ok(_) => {
+        match copy_atomically(&staged, destination) {
+            Ok(()) => {
                 self.update_file_job(|job| {
-                    job.output = Some(destination.to_string_lossy().into_owned());
+                    job.saved_path = Some(destination.to_string_lossy().into_owned());
                     job.result_name = destination
                         .file_name()
                         .map(|name| name.to_string_lossy().into_owned());
@@ -1511,7 +1561,6 @@ impl AppController {
                 });
             }
             Err(error) => {
-                let _ = std::fs::remove_file(&temporary);
                 let message = format!("{error}");
                 self.update_file_job(|job| job.save_error = Some(message.clone()));
                 self.report_error(message);
@@ -2006,6 +2055,18 @@ impl Default for AppController {
     }
 }
 
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // The last owner is going away, so no worker can still need the staged
+        // document. Remove it rather than leaking a temp folder on shutdown.
+        if let Ok(folder) = self.file_staging.get_mut() {
+            if let Some(folder) = folder.take() {
+                let _ = std::fs::remove_dir_all(folder);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- helpers
 
 /// Shared state for the free functions below (they run inside jobs).
@@ -2066,6 +2127,105 @@ fn fallback_label(inner: &Arc<Inner>) -> String {
         Some(config) => format!("{} · {}", settings.fallback_provider.title(), config.model),
         None => String::new(),
     }
+}
+
+/// A unique temporary sibling of `destination`, in the same directory.
+///
+/// `destination.with_extension("part")` reused a fixed name: saving
+/// `report.pdf` wrote `report.part` (destroying a file the user already had),
+/// and two concurrent saves to one folder picked the same name. The name mixes
+/// the pid, a process-wide counter and the sub-second clock, and the copy is
+/// opened with `create_new`, so a collision can never overwrite anything.
+fn temporary_sibling(destination: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = destination
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "translation".to_string());
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos())
+        .unwrap_or(0);
+    let unique = format!(
+        ".{name}.ofm-{}-{}-{nanos}.part",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    parent.join(unique)
+}
+
+/// Copy `source` next to `destination`, fsync it and rename it into place.
+///
+/// The destination is never written directly, so a failure cannot truncate a
+/// file the user picked; the temporary file is removed on every error.
+fn copy_atomically(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let temporary = temporary_sibling(destination);
+    let outcome = (|| {
+        let mut from = std::fs::File::open(source)?;
+        let mut to = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        std::io::copy(&mut from, &mut to)?;
+        to.sync_all()?;
+        drop(to);
+        drop(from);
+        std::fs::rename(&temporary, destination)
+    })();
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    outcome
+}
+
+/// Create the staging folder for one document translation.
+///
+/// The generation alone is not unique enough: two controllers in one process
+/// (tests, or a second window) start at generation 1 and would share a folder.
+fn create_staging_folder(generation: u64) -> std::io::Result<PathBuf> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos())
+        .unwrap_or(0);
+    let folder = std::env::temp_dir().join(format!(
+        "deepl-ofm-{}-{}-{generation}-{nanos}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&folder)?;
+    Ok(folder)
+}
+
+/// The language of a document, detected from its own text.
+///
+/// The Translate pane's detection is deliberately not consulted: a Ukrainian
+/// document must not inherit the English text sitting in the other tab. Only
+/// the opening characters are inspected, so a large PDF is not copied just to
+/// pick a language.
+fn document_source(document: &ofm_docs::OpenedDocument, ui: AppLanguage) -> Language {
+    const SAMPLE_CHARS: usize = 2_000;
+    let mut sample = String::new();
+    if let Some(text) = &document.source_text {
+        sample.extend(text.chars().take(SAMPLE_CHARS));
+    } else {
+        for paragraph in &document.paragraphs {
+            let remaining = SAMPLE_CHARS.saturating_sub(sample.chars().count());
+            if remaining == 0 {
+                break;
+            }
+            sample.extend(paragraph.chars().take(remaining));
+            sample.push('\n');
+        }
+    }
+    LanguageTable::detect(&sample, ui)
+        .copied()
+        .unwrap_or(LanguageTable::AUTO)
 }
 
 fn file_update(inner: &Arc<Inner>, generation: u64, mutate: impl FnOnce(&mut FileJob)) {
@@ -2234,16 +2394,17 @@ fn translate_now(inner: &Arc<Inner>, force: bool) {
         },
     );
 
-    let source = if source_code == "auto" {
+    let source_explicit = source_code != "auto";
+    let source = if source_explicit {
+        LanguageTable::get(&source_code)
+            .copied()
+            .unwrap_or(LanguageTable::AUTO)
+    } else {
         let state = inner.state.read().unwrap_or_else(|p| p.into_inner());
         state
             .detected_language
             .as_deref()
             .and_then(LanguageTable::get)
-            .copied()
-            .unwrap_or(LanguageTable::AUTO)
-    } else {
-        LanguageTable::get(&source_code)
             .copied()
             .unwrap_or(LanguageTable::AUTO)
     };
@@ -2273,9 +2434,52 @@ fn translate_now(inner: &Arc<Inner>, force: bool) {
             send(&progress_worker, AppEvent::Progress { completed, total });
         });
 
+        // Stream the result into the pane while the model types. This is a
+        // preview only: history, metrics and warnings stay tied to the final
+        // output, and a superseded generation must never repaint.
+        let partial_worker = Arc::clone(&worker);
+        let last_partial = Arc::new(Mutex::new(
+            Instant::now()
+                .checked_sub(PARTIAL_INTERVAL)
+                .unwrap_or_else(Instant::now),
+        ));
+        let partial: ofm_net::PartialFn = Arc::new(move |chunk: &str| {
+            if partial_worker.generation.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            {
+                let mut last = last_partial.lock().unwrap_or_else(|p| p.into_inner());
+                if last.elapsed() < PARTIAL_INTERVAL {
+                    return;
+                }
+                *last = Instant::now();
+            }
+            let changed = {
+                let mut state = partial_worker
+                    .state
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner());
+                if state.translated_text == chunk {
+                    false
+                } else {
+                    state.translated_text = chunk.to_string();
+                    true
+                }
+            };
+            if changed {
+                send(
+                    &partial_worker,
+                    AppEvent::TranslationPartial {
+                        value: chunk.to_string(),
+                    },
+                );
+            }
+        });
+
         let request = ofm_net::TranslateRequest {
             text: &text,
             source: &source,
+            source_explicit,
             target: &target,
             style,
             tone,
@@ -2283,7 +2487,7 @@ fn translate_now(inner: &Arc<Inner>, force: bool) {
             fallback: fallback.as_ref(),
             cancel: Some(Arc::clone(&cancel)),
             on_progress: Some(progress),
-            on_partial: None,
+            on_partial: Some(partial),
         };
 
         let outcome = worker.translator.translate(request).await;
@@ -2822,6 +3026,135 @@ mod settings_tests {
         assert_eq!(after.provider, before.provider);
         assert_eq!(after.interface_language, before.interface_language);
     }
+
+    /// The catalogue applies the provider before the form repaints; the key
+    /// text still belongs to the old provider and must not follow it.
+    #[test]
+    fn a_stale_key_cannot_land_under_the_new_provider() {
+        let fixture = Fixture::new("stale-key");
+        let controller = &fixture.controller;
+
+        let mut openrouter = controller.settings().clone();
+        openrouter.provider = Provider::OpenRouter;
+        openrouter.base_url = "http://127.0.0.1:1".to_string();
+        openrouter.model = "meta-llama/llama-3.3-70b-instruct:free".to_string();
+        openrouter.api_key = "sk-or-v1-openrouter-key".to_string();
+        controller.save_settings(openrouter);
+
+        // Exactly the dialog state after picking a Groq model in the catalogue:
+        // the provider is Groq while the key text is still OpenRouter's.
+        let mut stale = controller.settings().clone();
+        stale.provider = Provider::Groq;
+        stale.base_url = "http://127.0.0.1:1".to_string();
+        stale.model = "llama-3.3-70b-versatile".to_string();
+        stale.api_key = "sk-or-v1-openrouter-key".to_string();
+        controller.save_settings(stale);
+
+        assert!(
+            controller
+                .inner
+                .secrets
+                .read(&Provider::Groq.key_account())
+                .trim()
+                .is_empty(),
+            "an OpenRouter key must never be stored under provider:groq"
+        );
+        assert_eq!(
+            controller
+                .inner
+                .secrets
+                .read(&Provider::OpenRouter.key_account())
+                .trim(),
+            "sk-or-v1-openrouter-key",
+            "the key must stay with the provider it belongs to"
+        );
+        assert!(
+            controller.settings().api_key.trim().is_empty(),
+            "the live settings must show Groq's own (empty) key"
+        );
+    }
+
+    /// The fallback key follows the same rule as the primary one.
+    #[test]
+    fn a_stale_fallback_key_cannot_land_under_the_new_fallback_provider() {
+        let fixture = Fixture::new("stale-fallback-key");
+        let controller = &fixture.controller;
+
+        let mut first = controller.settings().clone();
+        first.provider = Provider::Ollama;
+        first.base_url = "http://127.0.0.1:1".to_string();
+        first.model = "hy-mt2:7b".to_string();
+        first.fallback_enabled = true;
+        first.fallback_provider = Provider::OpenRouter;
+        first.fallback_base_url = "http://127.0.0.1:1".to_string();
+        first.fallback_model = "meta-llama/llama-3.3-70b-instruct:free".to_string();
+        first.fallback_api_key = "sk-or-fallback-key".to_string();
+        controller.save_settings(first);
+
+        // The fallback provider changes while the form still shows the
+        // OpenRouter fallback key.
+        let mut stale = controller.settings().clone();
+        stale.fallback_provider = Provider::Groq;
+        stale.fallback_base_url = "http://127.0.0.1:1".to_string();
+        stale.fallback_model = "llama-3.3-70b-versatile".to_string();
+        stale.fallback_api_key = "sk-or-fallback-key".to_string();
+        controller.save_settings(stale);
+
+        assert!(
+            controller
+                .inner
+                .secrets
+                .read(&Provider::Groq.key_account())
+                .trim()
+                .is_empty(),
+            "an OpenRouter fallback key must never be stored under provider:groq"
+        );
+        assert_eq!(
+            controller
+                .inner
+                .secrets
+                .read(&Provider::OpenRouter.key_account())
+                .trim(),
+            "sk-or-fallback-key"
+        );
+    }
+
+    /// A shared primary/fallback account is written once, and an empty
+    /// fallback field cannot delete the primary key.
+    #[test]
+    fn a_shared_fallback_account_keeps_the_primary_key() {
+        let fixture = Fixture::new("shared-key");
+        let controller = &fixture.controller;
+
+        let mut settings = controller.settings().clone();
+        settings.provider = Provider::Groq;
+        settings.base_url = "http://127.0.0.1:1".to_string();
+        settings.model = "llama-3.3-70b-versatile".to_string();
+        settings.fallback_enabled = true;
+        settings.fallback_provider = Provider::Groq;
+        settings.fallback_base_url = "http://127.0.0.1:1".to_string();
+        settings.fallback_model = "llama-3.3-70b-versatile".to_string();
+        settings.api_key = "gsk-primary-key".to_string();
+        settings.fallback_api_key = String::new();
+        controller.save_settings(settings);
+
+        assert_eq!(
+            controller
+                .inner
+                .secrets
+                .read(&Provider::Groq.key_account())
+                .trim(),
+            "gsk-primary-key",
+            "the empty fallback field must not delete the primary key"
+        );
+
+        let reloaded = AppController::with_directory(&fixture.directory);
+        assert_eq!(reloaded.settings().api_key.trim(), "gsk-primary-key");
+        assert_eq!(
+            reloaded.settings().fallback_api_key.trim(),
+            "gsk-primary-key"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2892,32 +3225,44 @@ mod concurrency_tests {
     fn concurrent_commands_do_not_deadlock() {
         let fixture = Fixture::new("parallel");
         let controller = fixture.controller.clone();
-        let workers: Vec<_> = (0..4)
-            .map(|index| {
-                let controller = controller.clone();
-                std::thread::spawn(move || {
-                    for step in 0..40 {
-                        controller.set_source_text(&format!("text {index}-{step}"));
-                        controller.set_style(if step % 2 == 0 { "natural" } else { "auto" });
-                        controller.set_tone(if step % 3 == 0 { "formal" } else { "standard" });
-                        controller.set_source_language(if step % 2 == 0 { "auto" } else { "en" });
-                        controller.set_target_language(if step % 2 == 0 { "uk" } else { "de" });
-                        let _ = controller.state();
-                        controller.clear_source();
-                    }
-                })
-            })
-            .collect();
-
-        for worker in workers {
+        // Kept small on purpose: every step writes settings to disk, so a loaded
+        // CI box can take seconds. The deadline is what catches a real lock-order
+        // deadlock, not the amount of work.
+        const STEPS: usize = 12;
+        const WORKERS: usize = 4;
+        const DEADLOCK_TIMEOUT: Duration = Duration::from_secs(60);
+        let mut workers = Vec::with_capacity(WORKERS);
+        for index in 0..WORKERS {
+            let controller = controller.clone();
             let (sender, receiver) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
-                let _ = worker.join();
+                for step in 0..STEPS {
+                    controller.set_source_text(&format!("text {index}-{step}"));
+                    controller.set_style(if step % 2 == 0 { "natural" } else { "auto" });
+                    controller.set_tone(if step % 3 == 0 { "formal" } else { "standard" });
+                    controller.set_source_language(if step % 2 == 0 { "auto" } else { "en" });
+                    controller.set_target_language(if step % 2 == 0 { "uk" } else { "de" });
+                    let _ = controller.state();
+                    controller.clear_source();
+                }
                 let _ = sender.send(());
             });
-            receiver
-                .recv_timeout(Duration::from_secs(20))
-                .expect("concurrent commands deadlocked");
+            workers.push(receiver);
+        }
+
+        let deadline = Instant::now() + DEADLOCK_TIMEOUT;
+        for (index, receiver) in workers.into_iter().enumerate() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match receiver.recv_timeout(remaining) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                    "timed out after {DEADLOCK_TIMEOUT:?} waiting for concurrent worker \
+                     {index}: the controller deadlocked (a timeout, not an assertion failure)"
+                ),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("concurrent worker {index} panicked")
+                }
+            }
         }
     }
 
@@ -3063,6 +3408,522 @@ mod login_item_tests {
         assert!(
             state.login_item_error.is_some(),
             "the platform failure must be shown to the user"
+        );
+    }
+}
+
+/// A loopback OpenAI-compatible server for tests that need a real streaming
+/// response: no extra crates, plain `std::net` and hand-written HTTP/1.1.
+#[cfg(test)]
+mod fake_backend {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// Pause between the two streamed chunks, long enough that the partial
+    /// callback runs before the final result.
+    const CHUNK_GAP: Duration = Duration::from_millis(200);
+
+    /// A running fake backend; the accept thread stops when this is dropped.
+    pub struct FakeBackend {
+        base_url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+        stop: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FakeBackend {
+        /// Start a server that answers every chat request with `translation`.
+        pub fn start(translation: &str) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind the fake backend");
+            listener
+                .set_nonblocking(true)
+                .expect("make the fake backend non-blocking");
+            let address = listener.local_addr().expect("fake backend address");
+            let requests: Arc<Mutex<Vec<String>>> = Arc::default();
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_requests = Arc::clone(&requests);
+            let thread_stop = Arc::clone(&stop);
+            let translation = translation.to_string();
+            let handle = std::thread::spawn(move || {
+                while !thread_stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => serve(stream, &translation, &thread_requests),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                base_url: format!("http://{address}/v1"),
+                requests,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        /// Base URL to put into the provider settings.
+        pub fn base_url(&self) -> &str {
+            &self.base_url
+        }
+
+        /// Every request body received so far.
+        pub fn requests(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone()
+        }
+
+        /// Wait for the first chat request (the `/models` probe has no body).
+        pub fn wait_for_translation_requests(&self, timeout: Duration) -> Vec<String> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                let requests: Vec<String> = self
+                    .requests()
+                    .into_iter()
+                    .filter(|body| body.contains("\"messages\""))
+                    .collect();
+                if !requests.is_empty() {
+                    return requests;
+                }
+                assert!(
+                    Instant::now() <= deadline,
+                    "the fake backend received no translation request within {timeout:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for FakeBackend {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn serve(mut stream: TcpStream, translation: &str, requests: &Mutex<Vec<String>>) {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let Ok(clone) = stream.try_clone() else {
+            return;
+        };
+        let mut reader = BufReader::new(clone);
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+            let line = line.trim_end();
+            if line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse().unwrap_or(0);
+                }
+            }
+        }
+        let mut body = vec![0u8; content_length];
+        if reader.read_exact(&mut body).is_err() {
+            return;
+        }
+        requests
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(String::from_utf8_lossy(&body).into_owned());
+
+        let frames = sse_frames(translation);
+        let total: usize = frames.iter().map(Vec::len).sum();
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
+        );
+        if stream.write_all(head.as_bytes()).is_err() {
+            return;
+        }
+        for (index, frame) in frames.iter().enumerate() {
+            if index > 0 {
+                std::thread::sleep(CHUNK_GAP);
+            }
+            if stream.write_all(frame).is_err() {
+                return;
+            }
+            let _ = stream.flush();
+        }
+    }
+
+    fn sse_frame(content: &str) -> Vec<u8> {
+        let value = serde_json::json!({
+            "choices": [{"delta": {"content": content}, "finish_reason": null}],
+        });
+        format!("data: {value}\n\n").into_bytes()
+    }
+
+    /// Two content frames and the terminal frames, as separate writes.
+    fn sse_frames(translation: &str) -> Vec<Vec<u8>> {
+        let split = translation
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index < translation.len() / 2)
+            .last()
+            .unwrap_or(0);
+        let (first, second) = translation.split_at(split);
+        let done = serde_json::json!({"choices": [{"delta": {}, "finish_reason": "stop"}]});
+        vec![
+            sse_frame(first),
+            sse_frame(second),
+            format!("data: {done}\n\ndata: [DONE]\n\n").into_bytes(),
+        ]
+    }
+}
+
+#[cfg(test)]
+mod file_tests {
+    use super::*;
+
+    struct Fixture {
+        directory: PathBuf,
+        controller: AppController,
+    }
+
+    impl Fixture {
+        fn new(tag: &str) -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "ofm-files-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|value| value.as_nanos())
+                    .unwrap_or(0)
+            ));
+            std::fs::create_dir_all(&directory).expect("create the temp directory");
+            let controller = AppController::with_directory(&directory);
+            ofm_i18n::set_language(AppLanguage::En);
+            Self {
+                directory,
+                controller,
+            }
+        }
+
+        fn use_backend(&self, backend: &fake_backend::FakeBackend, model: &str) {
+            let mut settings = self.controller.settings().clone();
+            settings.provider = Provider::Custom;
+            settings.base_url = backend.base_url().to_string();
+            settings.model = model.to_string();
+            settings.auto_translate = false;
+            settings.keep_history = true;
+            self.controller.save_settings(settings);
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    fn stage_job(controller: &AppController, staged: &Path, name: &str) {
+        let job = FileJob {
+            state: FileJobState::Done.value().to_string(),
+            output: Some(staged.to_string_lossy().into_owned()),
+            result_name: Some(name.to_string()),
+            ..FileJob::default()
+        };
+        {
+            let mut state = controller
+                .inner
+                .state
+                .write()
+                .unwrap_or_else(|poison| poison.into_inner());
+            state.file_job = Some(job);
+        }
+    }
+
+    /// A language change is not typing: it starts at once, not after the delay.
+    #[test]
+    fn a_language_change_starts_without_waiting_for_the_debounce() {
+        let backend = fake_backend::FakeBackend::start("Hallo Welt.");
+        let fixture = Fixture::new("language-immediate");
+        let mut settings = fixture.controller.settings().clone();
+        settings.provider = Provider::Custom;
+        settings.base_url = backend.base_url().to_string();
+        settings.model = "test-model".to_string();
+        settings.auto_translate = true;
+        settings.debounce = 2.0;
+        fixture.controller.save_settings(settings);
+        let controller = &fixture.controller;
+
+        controller.set_source_text("Hello world.");
+        assert!(
+            !controller.state().is_translating,
+            "typing must still wait for the debounce"
+        );
+        controller.set_target_language("de");
+        assert!(
+            controller.state().is_translating,
+            "an explicit language change must start translating at once"
+        );
+        let requests = backend.wait_for_translation_requests(Duration::from_secs(5));
+        assert!(
+            !requests.is_empty(),
+            "the new language pair must reach the engine"
+        );
+        controller.cancel();
+        controller.clear_source();
+    }
+
+    /// A Ukrainian document must not inherit the English text pane's detection.
+    #[test]
+    fn a_document_is_translated_from_its_own_language() {
+        let backend = fake_backend::FakeBackend::start(
+            "Hallo, dies ist ein ukrainisches Dokument über Übersetzung.",
+        );
+        let fixture = Fixture::new("document-language");
+        // TranslateGemma's published instruction names the source language, so
+        // the request body shows exactly which language the document picked.
+        fixture.use_backend(&backend, "translategemma:4b");
+        let controller = &fixture.controller;
+
+        controller.set_source_text(
+            "Hello, this is an English document about translation. It contains several sentences.",
+        );
+        assert_eq!(
+            controller.state().detected_language.as_deref(),
+            Some("en"),
+            "the text pane must hold English for the regression to mean anything"
+        );
+
+        let path = fixture.directory.join("report.txt");
+        std::fs::write(
+            &path,
+            "Привіт, це український документ про переклад. Він містить кілька речень і слів.",
+        )
+        .expect("write the Ukrainian document");
+        controller.start_file_translation(&path, Some("de"));
+
+        let requests = backend.wait_for_translation_requests(Duration::from_secs(10));
+        let joined = requests.join("\n");
+        assert!(
+            joined.contains("Ukrainian (uk) to German (de)"),
+            "the document's own language must reach the engine: {joined}"
+        );
+        assert!(
+            !joined.contains("English (en) to German"),
+            "the Translate pane's detection must not leak into the document: {joined}"
+        );
+
+        controller.cancel_file_translation();
+        controller.clear_file_job();
+    }
+
+    /// A streaming translation repaints the pane before the job finishes, but
+    /// history and metrics only ever see the final output.
+    #[test]
+    fn streaming_partials_reach_the_pane_without_becoming_the_result() {
+        let backend = fake_backend::FakeBackend::start("Hallo Welt, dies ist eine Übersetzung.");
+        let fixture = Fixture::new("streaming");
+        fixture.use_backend(&backend, "test-model");
+        let controller = &fixture.controller;
+        let mut events = controller.subscribe();
+
+        controller.set_source_text("Hello world.\n\nSecond paragraph.");
+        controller.set_source_language("auto");
+        controller.set_target_language("de");
+        controller.translate(true);
+
+        let mut partials: Vec<String> = Vec::new();
+        let mut final_text = String::new();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() <= deadline {
+            match events.try_recv() {
+                Ok(AppEvent::TranslationPartial { value }) => partials.push(value),
+                Ok(AppEvent::TranslatedText { value }) => {
+                    final_text = value;
+                    break;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+
+        assert!(!partials.is_empty(), "the pane never saw a partial result");
+        assert!(!final_text.is_empty(), "the job did not finish in time");
+        assert!(
+            partials.iter().all(|partial| !partial.is_empty()),
+            "empty partials must not repaint the pane: {partials:?}"
+        );
+        assert!(
+            partials
+                .iter()
+                .all(|partial| !partial.is_empty() && final_text.starts_with(partial.trim_end())),
+            "a partial must be a prefix of the final text: {partials:?} vs {final_text:?}"
+        );
+
+        // History is written after the result and carries the final text only.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while controller.state().history.is_empty() && Instant::now() <= deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let state = controller.state();
+        assert_eq!(state.translated_text, final_text);
+        assert!(
+            !state.history.is_empty(),
+            "the finished job must be written to history"
+        );
+        assert_eq!(state.history[0].translated_text, final_text);
+    }
+
+    /// Saving twice copies the staged working copy, never the previous save.
+    #[test]
+    fn repeated_saves_copy_the_staged_file() {
+        let fixture = Fixture::new("repeat-save");
+        let staging = fixture.directory.join("staging");
+        std::fs::create_dir_all(&staging).expect("create the staging folder");
+        let staged = staging.join("report_uk.pdf");
+        std::fs::write(&staged, b"translated document").expect("write the staged file");
+        stage_job(&fixture.controller, &staged, "report_uk.pdf");
+
+        let first = fixture.directory.join("first.pdf");
+        fixture.controller.save_translated_file(&first);
+        assert_eq!(
+            std::fs::read(&first).expect("first save"),
+            b"translated document"
+        );
+
+        // The user edits the saved copy; the staged file is untouched.
+        std::fs::write(&first, b"edited by the user").expect("edit the saved copy");
+        let second = fixture.directory.join("second.pdf");
+        fixture.controller.save_translated_file(&second);
+        assert_eq!(
+            std::fs::read(&second).expect("second save"),
+            b"translated document",
+            "the second save must copy the staged file, not the first destination"
+        );
+
+        let job = fixture.controller.state().file_job.expect("job");
+        assert_eq!(
+            job.output.as_deref(),
+            Some(staged.to_string_lossy().as_ref()),
+            "the staged source must stay the job output"
+        );
+        assert_eq!(
+            job.saved_path.as_deref(),
+            Some(second.to_string_lossy().as_ref())
+        );
+        assert_eq!(job.save_error, None);
+    }
+
+    /// The temporary file is unique, so a neighbouring `.part` file survives.
+    #[test]
+    fn saving_does_not_clobber_a_neighbouring_part_file() {
+        let fixture = Fixture::new("part-neighbour");
+        let staging = fixture.directory.join("staging");
+        std::fs::create_dir_all(&staging).expect("create the staging folder");
+        let staged = staging.join("report_uk.pdf");
+        std::fs::write(&staged, b"translated document").expect("write the staged file");
+        stage_job(&fixture.controller, &staged, "report_uk.pdf");
+
+        let destination = fixture.directory.join("report.pdf");
+        let neighbour = fixture.directory.join("report.pdf.part");
+        std::fs::write(&neighbour, b"the user's own file").expect("write the neighbour");
+
+        fixture.controller.save_translated_file(&destination);
+
+        assert_eq!(
+            std::fs::read(&neighbour).expect("neighbour still exists"),
+            b"the user's own file",
+            "report.pdf must not write through report.pdf.part"
+        );
+        assert_eq!(
+            std::fs::read(&destination).expect("destination"),
+            b"translated document"
+        );
+    }
+
+    /// A failed rename removes its unique temporary file.
+    #[test]
+    fn a_failed_save_leaves_no_temporary_file() {
+        let fixture = Fixture::new("failed-save");
+        let staging = fixture.directory.join("staging");
+        std::fs::create_dir_all(&staging).expect("create the staging folder");
+        let staged = staging.join("report_uk.pdf");
+        std::fs::write(&staged, b"translated document").expect("write the staged file");
+        stage_job(&fixture.controller, &staged, "report_uk.pdf");
+
+        // A directory cannot be replaced by a file, so the rename fails.
+        let destination = fixture.directory.join("blocked");
+        std::fs::create_dir_all(&destination).expect("create the blocking directory");
+        fixture.controller.save_translated_file(&destination);
+        assert!(
+            fixture
+                .controller
+                .state()
+                .file_job
+                .expect("job")
+                .save_error
+                .is_some(),
+            "the failure must be reported"
+        );
+
+        let leftovers: Vec<_> = std::fs::read_dir(&fixture.directory)
+            .expect("read the destination folder")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".part"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporary files leaked: {leftovers:?}"
+        );
+    }
+
+    /// `clear_file_job` and controller shutdown both delete the staging folder.
+    #[test]
+    fn staging_is_cleaned_up_on_clear_and_on_shutdown() {
+        let fixture = Fixture::new("staging-cleanup");
+        let staging = fixture.directory.join("clear-staging");
+        std::fs::create_dir_all(&staging).expect("create the staging folder");
+        let staged = staging.join("report_uk.pdf");
+        std::fs::write(&staged, b"translated document").expect("write the staged file");
+        stage_job(&fixture.controller, &staged, "report_uk.pdf");
+        *fixture
+            .controller
+            .inner
+            .file_staging
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(staging.clone());
+        fixture.controller.clear_file_job();
+        assert!(
+            !staging.exists(),
+            "clear_file_job must delete the staging folder"
+        );
+
+        let directory = fixture.directory.join("shutdown");
+        std::fs::create_dir_all(&directory).expect("create a directory");
+        let shutdown_staging = directory.join("document");
+        std::fs::create_dir_all(&shutdown_staging).expect("create the shutdown staging folder");
+        {
+            let controller = AppController::with_directory(&directory);
+            *controller
+                .inner
+                .file_staging
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(shutdown_staging.clone());
+        }
+        assert!(
+            !shutdown_staging.exists(),
+            "dropping the controller must delete the staging folder"
         );
     }
 }

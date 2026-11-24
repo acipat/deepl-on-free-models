@@ -60,6 +60,7 @@ async fn translate(
         .translate(TranslateRequest {
             text,
             source: language("uk"),
+            source_explicit: true,
             target: language("en"),
             style: TranslationStyle::Auto,
             tone: TranslationTone::Standard,
@@ -83,6 +84,7 @@ async fn translate_observed(
         .translate(TranslateRequest {
             text,
             source: language("uk"),
+            source_explicit: true,
             target: language("en"),
             style: TranslationStyle::Auto,
             tone: TranslationTone::Standard,
@@ -459,6 +461,7 @@ async fn an_auto_source_language_is_not_prefixed() {
         .translate(TranslateRequest {
             text: "Привіт.",
             source: language("auto"),
+            source_explicit: false,
             target: language("en"),
             style: TranslationStyle::Auto,
             tone: TranslationTone::Standard,
@@ -475,6 +478,251 @@ async fn an_auto_source_language_is_not_prefixed() {
     assert!(!server.requests()[0]
         .content()
         .starts_with("The source language"));
+}
+
+#[tokio::test]
+async fn a_short_question_keeps_the_selected_style_and_tone() {
+    let server = FakeServer::start(|_| {
+        Reply::stream(vec![
+            ollama_frame("Könnten Sie mir den Bericht schicken?"),
+            ollama_done(1, 500_000_000),
+        ])
+    })
+    .await;
+    let config = ollama_config(&server, "hy-mt2:7b");
+    let output = Translator::new()
+        .translate(TranslateRequest {
+            text: "Could you send me the report?",
+            source: language("en"),
+            source_explicit: true,
+            target: language("de"),
+            style: TranslationStyle::Literal,
+            tone: TranslationTone::Formal,
+            config: &config,
+            fallback: None,
+            cancel: None,
+            on_progress: None,
+            on_partial: None,
+        })
+        .await
+        .expect("translated");
+
+    assert_eq!(output.text, "Könnten Sie mir den Bericht schicken?");
+    let prompt = server.requests()[0].content().to_string();
+    assert!(
+        prompt.contains("Please translate the following text into German."),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("[literal, word for word; formal and professional]"),
+        "the selected style and tone must survive: {prompt}"
+    );
+    assert!(!prompt.contains("heading"), "{prompt}");
+    assert_eq!(
+        prompt,
+        "The source language is English. Please translate the following text into German. \
+         Note that the translation style must strictly conform to [literal, word for word; \
+         formal and professional]:\n\nCould you send me the report?"
+    );
+}
+
+#[tokio::test]
+async fn a_markdown_heading_keeps_the_heading_instruction_and_the_style() {
+    let server = FakeServer::start(|_| {
+        Reply::stream(vec![ollama_frame("Titel"), ollama_done(1, 500_000_000)])
+    })
+    .await;
+    let config = ollama_config(&server, "hy-mt2:7b");
+    let output = Translator::new()
+        .translate(TranslateRequest {
+            text: "## Title",
+            source: language("en"),
+            source_explicit: true,
+            target: language("de"),
+            style: TranslationStyle::Literal,
+            tone: TranslationTone::Formal,
+            config: &config,
+            fallback: None,
+            cancel: None,
+            on_progress: None,
+            on_partial: None,
+        })
+        .await
+        .expect("translated");
+
+    assert_eq!(output.text, "## Titel");
+    let prompt = server.requests()[0].content().to_string();
+    assert!(
+        prompt.contains("Please translate this heading into German."),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("[literal, word for word; formal and professional]"),
+        "{prompt}"
+    );
+}
+
+#[tokio::test]
+async fn an_explicit_source_language_is_prefixed() {
+    let server = FakeServer::start(|_| {
+        Reply::stream(vec![
+            ollama_frame("Good morning."),
+            ollama_done(1, 500_000_000),
+        ])
+    })
+    .await;
+    let config = ollama_config(&server, "hy-mt2:7b");
+    Translator::new()
+        .translate(TranslateRequest {
+            text: "Guten Morgen.",
+            source: language("de"),
+            source_explicit: true,
+            target: language("en"),
+            style: TranslationStyle::Auto,
+            tone: TranslationTone::Standard,
+            config: &config,
+            fallback: None,
+            cancel: None,
+            on_progress: None,
+            on_partial: None,
+        })
+        .await
+        .expect("translated");
+
+    let prompt = server.requests()[0].content().to_string();
+    assert!(
+        prompt.starts_with("The source language is German. "),
+        "{prompt}"
+    );
+}
+
+#[tokio::test]
+async fn a_detected_source_language_is_not_prefixed() {
+    // The script detector maps Arabic script to Arabic; a Persian sentence then
+    // looks like Arabic. That guess must not be asserted to the model.
+    let detected = LanguageTable::detect("مرحبا بالعالم، هذا اختبار.", AppLanguage::System)
+        .expect("Arabic script is detected");
+    assert_eq!(detected.code, "ar");
+
+    let server = FakeServer::start(|_| {
+        Reply::stream(vec![
+            ollama_frame("Hello, world."),
+            ollama_done(1, 500_000_000),
+        ])
+    })
+    .await;
+    let config = ollama_config(&server, "hy-mt2:7b");
+    Translator::new()
+        .translate(TranslateRequest {
+            text: "مرحبا بالعالم، هذا اختبار.",
+            source: detected,
+            source_explicit: false,
+            target: language("en"),
+            style: TranslationStyle::Auto,
+            tone: TranslationTone::Standard,
+            config: &config,
+            fallback: None,
+            cancel: None,
+            on_progress: None,
+            on_partial: None,
+        })
+        .await
+        .expect("translated");
+
+    let prompt = server.requests()[0].content().to_string();
+    assert!(!prompt.starts_with("The source language"), "{prompt}");
+    assert!(
+        !prompt.contains("The source language is Arabic"),
+        "{prompt}"
+    );
+}
+
+#[tokio::test]
+async fn translate_gemma_uses_the_instruction_published_by_its_model_card() {
+    let server = FakeServer::start(|_| {
+        Reply::stream(vec![
+            ollama_frame("Hallo, Welt!"),
+            ollama_done(1, 500_000_000),
+        ])
+    })
+    .await;
+    let config = ollama_config(&server, "translategemma:4b");
+    let output = Translator::new()
+        .translate(TranslateRequest {
+            text: "Hello, world!",
+            source: language("en"),
+            source_explicit: true,
+            target: language("de"),
+            style: TranslationStyle::Auto,
+            tone: TranslationTone::Standard,
+            config: &config,
+            fallback: None,
+            cancel: None,
+            on_progress: None,
+            on_partial: None,
+        })
+        .await
+        .expect("translated");
+
+    assert_eq!(output.text, "Hallo, Welt!");
+    let prompt = server.requests()[0].content().to_string();
+    assert!(
+        prompt.starts_with(
+            "The source language is English. You are a professional English (en) to German \
+             (de) translator."
+        ),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("Please translate the following English text into German:"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.ends_with(":\n\n\nHello, world!"),
+        "two blank lines before the text: {prompt}"
+    );
+}
+
+#[tokio::test]
+async fn the_prompt_preview_equals_the_first_engine_prompt() {
+    let server = FakeServer::start(|_| {
+        Reply::stream(vec![
+            ollama_frame("Könnten Sie mir den Bericht schicken?"),
+            ollama_done(1, 500_000_000),
+        ])
+    })
+    .await;
+    let config = ollama_config(&server, "hy-mt2:7b");
+    let text = "Could you send me the report?";
+    let expected = ofm_net::first_prompt_for_text(
+        text,
+        language("en"),
+        true,
+        language("de"),
+        TranslationStyle::Literal,
+        TranslationTone::Formal,
+        &config.model,
+    )
+    .expect("a first prompt");
+
+    Translator::new()
+        .translate(TranslateRequest {
+            text,
+            source: language("en"),
+            source_explicit: true,
+            target: language("de"),
+            style: TranslationStyle::Literal,
+            tone: TranslationTone::Formal,
+            config: &config,
+            fallback: None,
+            cancel: None,
+            on_progress: None,
+            on_partial: None,
+        })
+        .await
+        .expect("translated");
+
+    assert_eq!(server.requests()[0].content(), expected);
 }
 
 #[tokio::test]
@@ -647,9 +895,10 @@ async fn empty_output_runs_the_retry_ladder_and_counts_a_warning() {
         .iter()
         .filter(|request| request.content().contains("Другий рядочок."))
         .collect();
-    // Prompt 0 gets three attempts, prompt 1 gets two; the sentence fallback
+    // The block is a sentence, not a heading, so it uses the full ladder for
+    // Auto/Standard: [generic x3, natural x2, plain x2]. The sentence fallback
     // cannot help a one-sentence block.
-    assert_eq!(first_block.len(), 5);
+    assert_eq!(first_block.len(), 7);
     assert_eq!(second_block.len(), 1);
     assert_eq!(first_block[1].body["options"]["temperature"], 0.3);
     // The caller's configuration is never mutated by the retries.
@@ -1116,6 +1365,7 @@ async fn cancellation_during_streaming_returns_quickly() {
             .translate(TranslateRequest {
                 text: &text,
                 source,
+                source_explicit: true,
                 target,
                 style: TranslationStyle::Auto,
                 tone: TranslationTone::Standard,
@@ -1436,6 +1686,7 @@ async fn cancellation_interrupts_a_stalled_request() {
             .translate(TranslateRequest {
                 text: &text,
                 source,
+                source_explicit: true,
                 target,
                 style: TranslationStyle::Auto,
                 tone: TranslationTone::Standard,
@@ -1551,6 +1802,7 @@ async fn duplicate_prompts_are_sent_once() {
         .translate(TranslateRequest {
             text: source,
             source: language("uk"),
+            source_explicit: true,
             target: language("en"),
             style: TranslationStyle::Auto,
             tone: TranslationTone::Formal,

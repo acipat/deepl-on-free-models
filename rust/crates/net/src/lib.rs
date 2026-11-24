@@ -11,6 +11,7 @@
 //!
 //! * [`Translator`] — translate, rewrite, list models and warm a model up.
 //! * [`TranslateRequest`] — everything one translation job needs.
+//! * [`PromptPlan`] — the per-block prompt ladder, also used by `ofm prompt`.
 //! * [`TranslationOutput`] — translated text plus warnings and metrics.
 //! * [`TranslationError`] / [`ErrorKind`] — typed, localisable failures.
 //! * [`model_listed`] — tolerant model-id matching for the Settings screen.
@@ -36,6 +37,7 @@
 //!     .translate(TranslateRequest {
 //!         text: "Привіт, світе.",
 //!         source,
+//!         source_explicit: true,
 //!         target,
 //!         style: TranslationStyle::Auto,
 //!         tone: TranslationTone::Standard,
@@ -58,11 +60,14 @@ mod budget;
 mod error;
 mod pipeline;
 mod probe;
+mod prompt;
 mod request;
 mod translator;
 mod wire;
 
 pub use crate::error::{ErrorKind, TranslationError};
 pub use crate::probe::model_listed;
+pub use crate::prompt::{first_prompt_for_text, PromptPlan};
 pub use crate::request::{CancelFlag, PartialFn, ProgressFn, TranslateRequest, TranslationOutput};
 pub use crate::translator::Translator;
+pub use ofm_config::PromptFamily;
