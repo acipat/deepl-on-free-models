@@ -77,7 +77,7 @@ def test_ollama_stream_end_to_end(provider):
     assert lines[2].startswith("Antwort")
     assert progress and progress[-1] == (2, 2)
     assert result.duration_ms is not None and result.duration_ms >= 0
-    assert result.tokens_per_second is not None
+    assert result.tokens_per_second == pytest.approx(400)
 
     body = provider.requests[0]["body"]
     assert body["stream"] is True
@@ -130,7 +130,7 @@ def test_controller_translates_against_local_server(qapp, provider, tmp_path):
     assert controller.translated_text.strip(), "controller produced no translation"
     assert "Antwort" in controller.translated_text
     assert controller.is_translating is False
-    assert controller.tokens_per_second is not None
+    assert controller.tokens_per_second == pytest.approx(400)
     assert len(controller.history.entries) == 1
     assert controller.history.entries[0].target_code == "en"
 

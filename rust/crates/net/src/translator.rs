@@ -33,8 +33,8 @@ use ofm_text::{
 use crate::budget::OutputBudget;
 use crate::error::{http_error, ErrorKind, TranslationError};
 use crate::pipeline::{
-    contains_markdown, is_letter, markdown_structure, split_mixed_line, validated, validated_whole,
-    with_source_language,
+    contains_markdown, is_letter, markdown_structure, preserves_table_row, split_mixed_line,
+    translation_chunks, validated, validated_whole, with_source_language,
 };
 use crate::probe::probe_models;
 use crate::prompt::{unique_prompts, whole_text_prompt, PromptPlan};
@@ -397,7 +397,7 @@ impl Translator {
                 rejected_whole_prompt = Some(prompt);
             }
         }
-        let chunks = TextChunker::split(&normalized);
+        let (chunks, table_chunks) = translation_chunks(&normalized);
         if chunks.is_empty() {
             return Ok(JobResult {
                 text: request.text.to_string(),
@@ -428,8 +428,11 @@ impl Translator {
             }
             let body = &chunk.text;
             let line = format!("{}{}", chunk.prefix, body);
-            if chunk.is_code || !body.chars().any(is_letter) {
+            let is_table = table_chunks.binary_search(&index).is_ok();
+            let long_table_row = is_table && line.chars().count() > TextChunker::LINE_LIMIT;
+            if chunk.is_code || !body.chars().any(is_letter) || long_table_row {
                 // Fenced code and punctuation-only lines pass through untouched.
+                warnings += usize::from(long_table_row && body.chars().any(is_letter));
                 translated.push(body.clone());
                 emit_partial(
                     &request.on_partial,
@@ -449,9 +452,13 @@ impl Translator {
                     &translatable,
                     request,
                     config,
-                    contains_markdown(&line),
-                    chunk.is_heading,
-                    rejected_whole_prompt.as_deref(),
+                    contains_markdown(&line) || is_table,
+                    chunk.is_heading && !is_table,
+                    BlockOptions {
+                        preserve_line_breaks: false,
+                        requires_markdown_structure: is_table,
+                        rejected_whole_prompt: rejected_whole_prompt.as_deref(),
+                    },
                 )
                 .await
             {
@@ -489,6 +496,11 @@ impl Translator {
                         log::debug!("protected tokens changed in the model output");
                         (translatable.clone(), true)
                     }
+                    Some(restored)
+                        if is_table && !preserves_table_row(&translatable, &restored) =>
+                    {
+                        (translatable.clone(), true)
+                    }
                     Some(restored) => (
                         TokenRestorer::preserve_trailing_punctuation(&translatable, &restored),
                         block.warning,
@@ -524,7 +536,7 @@ impl Translator {
         config: &BackendConfig,
         preserve_markdown: bool,
         is_heading: bool,
-        rejected_whole_prompt: Option<&str>,
+        options: BlockOptions<'_>,
     ) -> Result<BlockResult, TranslationError> {
         let body = text.trim();
         let plan = PromptPlan {
@@ -539,17 +551,8 @@ impl Translator {
             preserve_markdown,
         };
 
-        self.buffered_translation(
-            plan,
-            request,
-            config,
-            BlockOptions {
-                preserve_line_breaks: false,
-                requires_markdown_structure: false,
-                rejected_whole_prompt,
-            },
-        )
-        .await
+        self.buffered_translation(plan, request, config, options)
+            .await
     }
 
     /// Try every prompt (with lowered-temperature retries) until one validates.
@@ -588,7 +591,8 @@ impl Translator {
                     continue;
                 };
                 if options.requires_markdown_structure
-                    && markdown_structure(&clean) != markdown_structure(source)
+                    && (markdown_structure(&clean) != markdown_structure(source)
+                        || !preserves_table_row(source, &clean))
                 {
                     log::debug!("markdown structure changed (prompt {index}, attempt {attempt})");
                     continue;

@@ -202,13 +202,14 @@ class TextChunker:
         return text.replace("\r\n", "\n").replace("\r", "\n")
 
     @staticmethod
-    def split(text: str) -> list[TextChunk]:
+    def split(text: str, *, keep_whole_lines: set[int] | None = None) -> list[TextChunk]:
         """Split ``text`` into one chunk per non-empty line.
 
         Leading and trailing blank lines are dropped (Swift behaviour); the
         number of blank lines between two chunks is preserved in
         ``separator_before``.  A fenced code block becomes a single chunk with
-        ``is_code=True`` so it is never sentence-split.
+        ``is_code=True`` so it is never sentence-split. Line indices in
+        ``keep_whole_lines`` are zero-based in the original input.
         """
         normalized = TextChunker.normalize(text)
         lines = normalized.split("\n")
@@ -254,7 +255,9 @@ class TextChunker:
                 continue
 
             trimmed = line.rstrip()
-            if len(trimmed) <= TextChunker.limit:
+            if len(trimmed) <= TextChunker.limit or (
+                keep_whole_lines is not None and position in keep_whole_lines
+            ):
                 prefix, body, is_heading = _parse_prefix(trimmed)
                 chunks.append(
                     TextChunk(

@@ -66,6 +66,8 @@ _MARKDOWN_INLINE_FORMATTING = tuple(
 )
 _INLINE_CODE = re.compile(r"(?<!`)(`+)(?!`)(.*?)(?<!`)\1(?!`)")
 _MARKDOWN_LINK = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
+_TABLE_ESCAPE = re.compile(r"\\[\\|]")
+_TABLE_DELIMITER = re.compile(r":?-+:?")
 _MARKDOWN_PATTERNS = tuple(
     re.compile(pattern, re.MULTILINE)
     for pattern in (
@@ -327,7 +329,61 @@ def _openai_stats(frame: dict) -> tuple[int, float] | None:
 
 def _contains_markdown(text: str) -> bool:
     """Port of ``Sources/HyMT/Support/MarkdownDetector.swift``."""
-    return any(pattern.search(text) for pattern in _MARKDOWN_PATTERNS)
+    return any(pattern.search(text) for pattern in _MARKDOWN_PATTERNS) or (
+        "\n" in text and "|" in text and bool(_markdown_table_rows(text.split("\n")))
+    )
+
+
+def _table_cells(line: str) -> tuple[list[str], bool, bool] | None:
+    """Split cells on pipes outside of backtick spans and backslash escapes."""
+    row = _TABLE_ESCAPE.sub("x", _INLINE_CODE.sub("x", line.strip()))
+    if "|" not in row:
+        return None
+    leading = row.startswith("|")
+    trailing = row.endswith("|")
+    cells = row.split("|")[int(leading) : -1 if trailing else None]
+    return ([cell.strip() for cell in cells], leading, trailing) if cells else None
+
+
+def _table_shape(line: str) -> tuple[tuple[bool, ...], bool, bool] | None:
+    row = _table_cells(line)
+    if row is None:
+        return None
+    cells, leading, trailing = row
+    return tuple(bool(cell) for cell in cells), leading, trailing
+
+
+def _markdown_table_rows(lines: list[str]) -> set[int]:
+    """Identify headers, delimiters and pipe-bearing rows in GFM tables."""
+    rows: set[int] = set()
+    previous_columns = 0
+    in_table = False
+    fence = None
+    for index, line in enumerate(lines):
+        if fence is not None:
+            if _closes_fence(line, fence):
+                fence = None
+            continue
+        fence = _fence_marker(line)
+        row = (
+            _table_cells(line)
+            if fence is None and not line.startswith(("    ", "\t")) and not _parse_prefix(line)[0]
+            else None
+        )
+        if row is None:
+            previous_columns = 0
+            in_table = False
+            continue
+        cells, _, _ = row
+        if previous_columns == len(cells) and all(
+            _TABLE_DELIMITER.fullmatch(cell) for cell in cells
+        ):
+            rows.update((index - 1, index))
+            in_table = True
+        elif in_table:
+            rows.add(index)
+        previous_columns = len(cells)
+    return rows
 
 
 def _split_mixed_line(text: str) -> tuple[str, str] | None:
@@ -718,7 +774,9 @@ class Translator:
         cancel: threading.Event | None,
     ) -> _JobResult:
         normalized = TextChunker.normalize(text)
-        chunks = TextChunker.split(normalized)
+        lines = normalized.split("\n") if "|" in normalized else []
+        table_rows = _markdown_table_rows(lines)
+        chunks = TextChunker.split(normalized, keep_whole_lines=table_rows)
         if not chunks:
             return _JobResult(text=text, warnings=0, tokens=0, seconds=0.0)
 
@@ -744,6 +802,7 @@ class Translator:
                     config=config,
                     source_language=explicit_source,
                     gemma_source=gemma_source,
+                    preserve_table=bool(table_rows),
                     on_progress=on_progress,
                     on_partial=on_partial,
                     cancel=cancel,
@@ -758,15 +817,21 @@ class Translator:
         tokens = 0
         seconds = 0.0
         stats_complete = True
+        line_number = next((index for index, line in enumerate(lines) if line.strip()), 0)
 
         for index, chunk in enumerate(chunks):
             self._raise_if_cancelled(cancel)
+            line_number += chunk.separator_before.count("\n")
+            preserve_table = line_number in table_rows
             body = chunk.text
             line = chunk.prefix + body
-            if getattr(chunk, "is_code", False) or not any(
-                char.isalpha() for char in body
-            ):
-                # Fenced code and punctuation-only lines pass through untouched.
+            has_words = any(char.isalpha() for char in body)
+            long_table_row = preserve_table and has_words and len(body) > TextChunker.limit
+            if chunk.is_code or long_table_row or not has_words:
+                if chunk.is_code:
+                    line_number += body.count("\n")
+                if long_table_row:
+                    warnings += 1
                 translated.append(body)
                 self._emit_partial(on_partial, TextChunker.compose(chunks[: index + 1], translated))
                 self._report(on_progress, index + 1, total)
@@ -774,7 +839,7 @@ class Translator:
 
             keep = ""
             translatable = body
-            mixed = _split_mixed_line(body)
+            mixed = None if preserve_table else _split_mixed_line(body)
             if mixed is not None:
                 keep, translatable = mixed
 
@@ -788,8 +853,9 @@ class Translator:
                     source_language=explicit_source if gemma_source is None else None,
                     gemma_source=gemma_source,
                     cancel=cancel,
-                    preserve_markdown=_contains_markdown(line),
+                    preserve_markdown=preserve_table or _contains_markdown(line),
                     is_heading=chunk.is_heading,
+                    preserve_table=preserve_table,
                     rejected_prompt=rejected_prompt,
                 )
             except TranslationError as exc:
@@ -806,8 +872,15 @@ class Translator:
                 continue
 
             restored = TokenRestorer.restore(translatable, block.text)
+            if restored is not None and preserve_table:
+                translated_row = chunk.prefix + restored
+                if (
+                    _table_shape(line) != _table_shape(translated_row)
+                    or _INLINE_CODE.findall(line) != _INLINE_CODE.findall(translated_row)
+                ):
+                    restored = None
             if restored is None:
-                logger.debug("protected tokens changed in model output")
+                logger.debug("protected tokens or table cells changed in model output")
                 translated_text = translatable
                 warning = True
             else:
@@ -844,6 +917,7 @@ class Translator:
         config: BackendConfig,
         source_language: Language | None,
         gemma_source: Language | None,
+        preserve_table: bool,
         on_progress: Callable[[int, int], None] | None,
         on_partial: Callable[[str], None] | None,
         cancel: threading.Event | None,
@@ -852,14 +926,16 @@ class Translator:
         if gemma_source is not None:
             prompt = PromptBuilder.translate_gemma_prompt(text, gemma_source, target)
         else:
-            preserve_markdown = _contains_markdown(text) or any(
+            preserve_markdown = preserve_table or _contains_markdown(text) or any(
                 _fence_marker(line) is not None for line in text.split("\n")
             )
             instruction = PromptBuilder.instruction(style, tone, target.english_name, preserve_markdown)
             constraints = ""
             if "\n" in text:
                 constraints += " Preserve line breaks and blank lines."
-            if preserve_markdown or "http://" in text or "https://" in text or "](" in text:
+            if preserve_table:
+                constraints += " Keep table structure, URLs and code unchanged."
+            elif preserve_markdown or "http://" in text or "https://" in text or "](" in text:
                 constraints += " Keep URLs and code unchanged."
             if constraints:
                 instruction = instruction.removesuffix(":") + "." + constraints
@@ -927,9 +1003,10 @@ class Translator:
         if len(source_lines) != len(result_lines):
             return None
 
+        table_rows = _markdown_table_rows(source_lines) if "|" in source else set()
         fence = None
         restored_lines: list[str] = []
-        for before, after in zip(source_lines, result_lines):
+        for index, (before, after) in enumerate(zip(source_lines, result_lines)):
             if fence is not None:
                 if before != after:
                     return None
@@ -954,6 +1031,8 @@ class Translator:
                 continue
             restored = TokenRestorer.restore(before, after)
             if restored is None or _INLINE_CODE.findall(before) != _INLINE_CODE.findall(restored):
+                return None
+            if index in table_rows and _table_shape(before) != _table_shape(restored):
                 return None
             after_prose = _INLINE_CODE.sub("", restored)
             if (
@@ -988,13 +1067,14 @@ class Translator:
         cancel: threading.Event | None,
         preserve_markdown: bool,
         is_heading: bool = False,
+        preserve_table: bool = False,
         rejected_prompt: str | None = None,
     ) -> _BlockResult:
         """Choose the prompt ladder for one line and translate it."""
         body = text.strip()
         if gemma_source is not None:
             prompts = [PromptBuilder.translate_gemma_prompt(body, gemma_source, target)]
-        elif _is_structural_heading(body, is_heading):
+        elif not preserve_table and _is_structural_heading(body, is_heading):
             heading = PromptBuilder.heading_prompt(
                 body,
                 style,
@@ -1028,6 +1108,11 @@ class Translator:
                 prompts = [styled, plain_fallback, literal]
             else:
                 prompts = [styled, natural, plain_fallback]
+        if preserve_table and gemma_source is None:
+            prompts = [
+                prompt.replace(":\n\n", ". Keep table structure unchanged.\n\n", 1)
+                for prompt in prompts
+            ]
         if rejected_prompt is not None:
             prompts = [
                 prompt for prompt in prompts

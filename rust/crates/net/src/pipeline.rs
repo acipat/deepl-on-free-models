@@ -9,10 +9,138 @@ use std::sync::OnceLock;
 use fancy_regex::Regex;
 
 use ofm_i18n::Language;
-use ofm_text::{OutputSanitizer, TextChunker, TokenRestorer};
+use ofm_text::{OutputSanitizer, TextChunk, TextChunker, TokenRestorer};
 
 const INLINE_CODE: &str = r"(?<!`)(`+)(?!`)(.*?)(?<!`)\1(?!`)";
 const MARKDOWN_LINK: &str = r"\[([^\]]+)\]\(([^)\s]+)\)";
+
+fn inline_code() -> &'static Regex {
+    static INLINE: OnceLock<Regex> = OnceLock::new();
+    INLINE.get_or_init(|| Regex::new(INLINE_CODE).expect("valid inline code regex"))
+}
+
+#[derive(PartialEq, Eq)]
+pub(crate) struct TableRow {
+    separators: usize,
+    leading: bool,
+    trailing: bool,
+    delimiter: bool,
+    nonempty_cells: Vec<bool>,
+}
+
+impl TableRow {
+    fn columns(&self) -> usize {
+        self.separators + 1 - usize::from(self.leading) - usize::from(self.trailing)
+    }
+}
+
+/// Read the shape of a pipe-separated Markdown row without interpreting its cells.
+pub(crate) fn table_row(line: &str) -> Option<TableRow> {
+    if !line.contains('|') {
+        return None;
+    }
+    let without_code = inline_code().replace_all(line, "x");
+    let line = without_code.trim();
+    let mut separators = Vec::new();
+    let mut escaped = false;
+    for (offset, character) in line.bytes().enumerate() {
+        if character == b'\\' {
+            escaped = !escaped;
+            continue;
+        }
+        if character == b'|' && !escaped {
+            separators.push(offset);
+        }
+        escaped = false;
+    }
+    let leading = *separators.first()? == 0;
+    let trailing = *separators.last()? + 1 == line.len();
+    let mut start = 0;
+    let mut delimiter = true;
+    let mut nonempty_cells = Vec::new();
+    for end in separators.iter().copied().chain([line.len()]) {
+        let cell = line[start..end].trim();
+        let outside_edge = end == 0 || (end == line.len() && trailing);
+        start = end + 1;
+        if outside_edge {
+            continue;
+        }
+        nonempty_cells.push(!cell.is_empty());
+        let cell = cell.strip_prefix(':').unwrap_or(cell);
+        let cell = cell.strip_suffix(':').unwrap_or(cell);
+        delimiter &= !cell.is_empty() && cell.bytes().all(|character| character == b'-');
+    }
+    Some(TableRow {
+        separators: separators.len(),
+        leading,
+        trailing,
+        delimiter,
+        nonempty_cells,
+    })
+}
+
+/// Mark the source lines belonging to tables with a header and alignment row.
+pub(crate) fn markdown_table_lines(text: &str) -> Vec<usize> {
+    let mut lines = TextChunker::lines_with_code(text).enumerate().peekable();
+    let mut table_lines = Vec::new();
+    let mut in_table = false;
+    while let Some((index, (line, code))) = lines.next() {
+        let Some(row) = (!code).then(|| table_row(line)).flatten() else {
+            in_table = false;
+            continue;
+        };
+        if !in_table && !row.delimiter {
+            in_table = lines.peek().is_some_and(|(_, (next, code))| {
+                !code
+                    && table_row(next)
+                        .is_some_and(|next| next.delimiter && next.columns() == row.columns())
+            });
+        }
+        if in_table {
+            table_lines.push(index);
+        }
+    }
+    table_lines
+}
+
+/// Identify table rows in the legacy chunk list without breaking long rows.
+pub(crate) fn translation_chunks(text: &str) -> (Vec<TextChunk>, Vec<usize>) {
+    let table_lines = markdown_table_lines(text);
+    let chunks = TextChunker::split_preserving(text, |position| {
+        table_lines.binary_search(&position).is_ok()
+    });
+    let mut table_chunks = Vec::new();
+    if !table_lines.is_empty() {
+        let mut position = text
+            .lines()
+            .take_while(|line| line.trim().is_empty())
+            .count();
+        for (index, chunk) in chunks.iter().enumerate() {
+            position += chunk
+                .separator_before
+                .bytes()
+                .filter(|&byte| byte == b'\n')
+                .count();
+            if table_lines.binary_search(&position).is_ok() {
+                table_chunks.push(index);
+            }
+            position += chunk.text.bytes().filter(|&byte| byte == b'\n').count();
+        }
+    }
+    (chunks, table_chunks)
+}
+
+pub(crate) fn preserves_table_row(source: &str, translated: &str) -> bool {
+    table_row(source) == table_row(translated)
+        && inline_code()
+            .find_iter(source)
+            .filter_map(Result::ok)
+            .map(|span| span.as_str())
+            .eq(inline_code()
+                .find_iter(translated)
+                .filter_map(Result::ok)
+                .map(|span| span.as_str()))
+}
 
 /// Python's `str.isalpha()`: a letter of category `L*`.
 ///
@@ -270,14 +398,14 @@ pub(crate) fn validated_whole(raw: &str, source: &str, target: &Language) -> Opt
     let candidate = OutputSanitizer::strip_preamble(raw, source);
     let cleaned = TextChunker::normalize(&OutputSanitizer::clean(&candidate));
     let source_lines = TextChunker::lines_with_code(source);
+    let table_lines = markdown_table_lines(source);
     let mut reply_lines = TextChunker::lines_with_code(&cleaned);
     let mut translated = Vec::new();
 
-    static INLINE: OnceLock<Regex> = OnceLock::new();
     static LINKS: OnceLock<Regex> = OnceLock::new();
-    let inline = INLINE.get_or_init(|| Regex::new(INLINE_CODE).expect("valid inline code regex"));
+    let inline = inline_code();
     let links = LINKS.get_or_init(|| Regex::new(MARKDOWN_LINK).expect("valid Markdown link regex"));
-    for (original, source_code) in source_lines {
+    for (index, (original, source_code)) in source_lines.enumerate() {
         let (line, reply_code) = reply_lines.next()?;
         let original_prose = inline.replace_all(original, "");
         if source_code || reply_code || !original_prose.chars().any(is_letter) {
@@ -294,6 +422,8 @@ pub(crate) fn validated_whole(raw: &str, source: &str, target: &Language) -> Opt
         let translated_prose = inline.replace_all(&restored, "");
         let source_structure = markdown_structure(original);
         if source_structure != markdown_structure(&restored)
+            || (table_lines.binary_search(&index).is_ok()
+                && table_row(original) != table_row(&restored))
             || (!source_structure.is_empty()
                 && TextChunker::split(original)[0].prefix
                     != TextChunker::split(&restored)[0].prefix)

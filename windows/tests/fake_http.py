@@ -69,7 +69,13 @@ class FakeProviderHandler(BaseHTTPRequestHandler):
             self.wfile.write((json.dumps(frame) + "\n").encode())
             self.wfile.flush()
             time.sleep(0.005)
-        done = {"model": "hy-mt2:7b", "message": {"content": ""}, "done": True}
+        done = {
+            "model": "hy-mt2:7b",
+            "message": {"content": ""},
+            "done": True,
+            "eval_count": 12,
+            "eval_duration": 30_000_000,
+        }
         self.wfile.write((json.dumps(done) + "\n").encode())
 
     def _openai(self) -> None:
