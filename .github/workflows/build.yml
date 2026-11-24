@@ -2,7 +2,19 @@ name: build
 
 on:
   push:
+    # A Python- or Rust-only change cannot break the Swift app, and the macOS
+    # runner is the scarcest resource in this repository.
+    paths: &swift-paths
+      - "Sources/**"
+      - "Tests/**"
+      - "Resources/**"
+      - "ios/**"
+      - "Package.swift"
+      - "Package.resolved"
+      - "build.sh"
+      - ".github/workflows/build.yml"
   pull_request:
+    paths: *swift-paths
 
 permissions:
   contents: read

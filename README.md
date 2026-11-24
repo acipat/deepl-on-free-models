@@ -33,6 +33,11 @@
   <img src="docs/demo-framed.gif" width="900" alt="DeepL-oFM demo: three result views, PDF and DOCX translation, nine interface languages">
 </p>
 
+> **Windows.** A PySide6 port lives in [`windows/`](windows/README.md): the same
+> translation core (prompts, chunking, token protection, documents, providers)
+> with a native Qt window, tray icon and global hotkeys. Start it with
+> `windows\run.bat`; no Xcode or Swift toolchain required.
+
 ## Why DeepL-oFM
 
 Translate from a Mac window or use a shortcut from another app. Ollama can

@@ -40,3 +40,16 @@ docs/.local*
 # Xcode user data
 ios/**/xcuserdata/
 ios/**/*.xcuserstate
+
+# Windows port
+windows/.venv/
+windows/build/
+windows/dist/
+windows/*.spec.bak
+windows/__pycache__/
+__pycache__/
+*.py[cod]
+windows/tools/app.ico
+
+# Local review transcripts and scratch
+.tmp/

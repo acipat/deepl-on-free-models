@@ -1,0 +1,58 @@
+name: windows
+
+on:
+  # On a branch only the pull request runs, so a push is not reported twice.
+  push:
+    branches: [main]
+    paths:
+      - "windows/**"
+      - ".github/workflows/windows.yml"
+  pull_request:
+    paths:
+      - "windows/**"
+      - ".github/workflows/windows.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: windows/requirements.txt
+      - name: Install dependencies
+        working-directory: windows
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+      - name: Tests
+        working-directory: windows
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest tests -q
+      - name: Smoke test the window
+        working-directory: windows
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python tools/smoke_test.py
+      - name: Build executable
+        working-directory: windows
+        run: |
+          python -m pip install pyinstaller pillow
+          python tools/make_icon.py
+          python -m PyInstaller --noconfirm --clean DeepL-oFM.spec
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DeepL-oFM-windows
+          path: windows/dist/DeepL-oFM
+          retention-days: 14
