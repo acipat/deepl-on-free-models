@@ -1,0 +1,119 @@
+name: rust
+
+on:
+  # On a branch only the pull request runs, so a push is not reported twice.
+  push:
+    branches: [main]
+    paths:
+      - "rust/**"
+      - ".github/workflows/rust.yml"
+  pull_request:
+    paths:
+      - "rust/**"
+      - ".github/workflows/rust.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      # The macOS runner pool is scarce here, so a pull request does not wait
+      # for it; `main` and manual runs still cover macOS.
+      matrix:
+        os: >-
+          ${{
+            github.event_name == 'pull_request'
+              && fromJSON('["ubuntu-latest","windows-latest"]')
+              || fromJSON('["ubuntu-latest","windows-latest","macos-latest"]')
+          }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Format
+        working-directory: rust
+        run: cargo fmt --all --check
+      - name: Clippy
+        working-directory: rust
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        working-directory: rust
+        run: cargo test
+      - name: Build the CLI
+        working-directory: rust
+        run: cargo build --release -p ofm-cli
+      - uses: actions/upload-artifact@v4
+        if: matrix.os != 'ubuntu-latest'
+        with:
+          name: ofm-${{ matrix.os }}
+          path: |
+            rust/target/release/ofm
+            rust/target/release/ofm.exe
+          retention-days: 7
+          if-no-files-found: warn
+
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: >-
+          ${{
+            github.event_name == 'pull_request'
+              && fromJSON('["windows-latest"]')
+              || fromJSON('["windows-latest","macos-latest"]')
+          }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Build the desktop shell
+        working-directory: rust
+        # `crates/desktop/icons/` is committed, so no icon generation is needed.
+        run: cargo build --release -p ofm-desktop
+
+  bundle:
+    # Installers are only built on Windows: WiX runs there, and that is the
+    # platform these ports are for.
+    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build the installers
+        working-directory: rust/crates/desktop
+        # `cargo tauri` needs `cargo install tauri-cli`; the npm package is a
+        # prebuilt binary and is invoked directly, which is much faster and does
+        # not depend on the global bin directory being on PATH.
+        run: npx --yes "@tauri-apps/cli@^2" build --verbose
+      - name: List what was produced
+        working-directory: rust/target/release/bundle
+        run: Get-ChildItem -Recurse -Include *.msi,*.exe | Select-Object FullName, Length
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DeepL-oFM-installers
+          path: |
+            rust/target/release/bundle/msi/*.msi
+            rust/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 30

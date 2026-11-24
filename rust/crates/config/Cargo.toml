@@ -1,0 +1,16 @@
+[package]
+name = "ofm-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+dirs = "7.0.0"
+ofm-i18n = { version = "2.0.1", path = "../i18n" }
+serde.workspace = true
+serde_json.workspace = true
+unicode-normalization = "0.1"
+log.workspace = true

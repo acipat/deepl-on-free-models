@@ -1,0 +1,40 @@
+[package]
+name = "ofm-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+base64 = "0.23"
+dirs = "7.0.0"
+log.workspace = true
+# Declared for the workspace graph but off by default: the public API returns
+# `&'static str` message keys instead of localised text, so `ofm-store` must
+# build while `ofm-i18n` is still in flux. Enable the implicit `ofm-i18n`
+# feature when the UI layer finally needs translated strings from here.
+ofm-i18n = { version = "2.0.1", path = "../i18n", optional = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+# keyring 3.x ships no credential backend unless a platform feature is enabled;
+# without one it hands out an in-memory mock and the store would silently use
+# the fallback file. Enable the native store of each supported target so a key
+# written by the Python port (Credential Manager / Keychain) is read here too.
+# Linux stays feature-free on purpose: the mock is rejected by the probe and the
+# owner-only file keeps the tests hermetic.
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3.6.3", features = ["windows-native"] }
+windows = { version = "0.62.2", features = ["Win32_Security_Credentials"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", features = ["apple-native"] }
+
+[target.'cfg(not(any(windows, target_os = "macos")))'.dependencies]
+keyring = "3.6.3"
+
+[dev-dependencies]
+serde_json.workspace = true

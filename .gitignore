@@ -53,3 +53,9 @@ windows/tools/app.ico
 
 # Local review transcripts and scratch
 .tmp/
+
+# Rust workspace
+rust/target/
+.cargo-home/
+rust/dist/
+rust/target/release-stage/

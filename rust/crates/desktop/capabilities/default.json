@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Core permissions for the main window: the event bridge, window control and drag and drop. The application's own commands are always allowed because they are defined in this app.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

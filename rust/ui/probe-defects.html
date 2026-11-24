@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>DeepL-oFM UI probe: shortcut source text and Files reset</title>
+  </head>
+  <body>
+    <!--
+      Runs the standalone UI in an iframe against the mock, exactly the page a
+      browser opens: index.html?still=1&mock=1.  `probe.sh` loads this file in
+      headless Chrome and fails unless every check passes.
+    -->
+    <iframe id="ui" src="index.html?still=1&mock=1" style="width: 1180px; height: 800px; border: 0"></iframe>
+    <pre id="out">pending</pre>
+    <script>
+      (function () {
+        "use strict";
+        var results = [];
+        var frame = document.getElementById("ui");
+        var out = document.getElementById("out");
+
+        function check(name, ok, detail) {
+          results.push({ name: name, ok: !!ok, detail: detail === undefined ? null : detail });
+        }
+
+        function sleep(ms) {
+          return new Promise(function (resolve) {
+            setTimeout(resolve, ms);
+          });
+        }
+
+        function waitFor(test, timeout, label) {
+          var started = Date.now();
+          return new Promise(function (resolve, reject) {
+            (function poll() {
+              if (test()) return resolve();
+              if (Date.now() - started > timeout) {
+                return reject(new Error("timed out waiting for " + label));
+              }
+              setTimeout(poll, 30);
+            })();
+          });
+        }
+
+        function finish(error) {
+          if (error) {
+            check("probe completed", false, String((error && error.stack) || error));
+          }
+          out.textContent = JSON.stringify(
+            { ok: results.every(function (item) { return item.ok; }), results: results },
+            null,
+            2
+          );
+        }
+
+        frame.addEventListener("load", function () {
+          (async function () {
+            var win = frame.contentWindow;
+            var doc = frame.contentDocument;
+            await waitFor(function () {
+              return doc && win.OFM_UI && win.OFM_UI.currentState() && win.OFM_UI.currentState().version;
+            }, 6000, "the UI to load");
+            var ui = win.OFM_UI;
+            var mock = win.OFM_MOCK;
+            if (!mock) throw new Error("the standalone mock is not active");
+            var input = doc.getElementById("sourceInput");
+            var dropZone = doc.getElementById("dropZone");
+            var fileSelected = doc.getElementById("fileSelected");
+            var retry = doc.getElementById("fileTryAgainBtn");
+
+            // Record every set_source_text the UI sends, so a cancelled
+            // debounce can be proven and not merely inferred.
+            var sent = [];
+            var originalInvoke = mock.invoke.bind(mock);
+            mock.invoke = function (name, args) {
+              if (name === "set_source_text") sent.push(args && args.text);
+              return originalInvoke(name, args);
+            };
+
+            function typeInto(text) {
+              input.focus();
+              input.value = text;
+              input.dispatchEvent(new win.Event("input", { bubbles: true }));
+            }
+
+            // -- Defect D: a captured selection must reach a focused editor ----
+            typeInto("typed by the user");
+            await sleep(180);
+            check(
+              "the source editor keeps focus in the background window",
+              doc.activeElement === input
+            );
+            var captured = "Captured selection from another application.";
+            mock.emit({ type: "sourceText", value: captured });
+            await sleep(60);
+            check(
+              "a captured selection reaches the focused editor",
+              input.value === captured,
+              { value: input.value }
+            );
+            check(
+              "the UI state follows the captured selection",
+              ui.currentState().sourceText === captured,
+              { sourceText: ui.currentState().sourceText }
+            );
+
+            // A debounced send typed just before the shortcut must be dropped.
+            var beforePending = sent.length;
+            typeInto("pending typing that must not be sent");
+            mock.emit({ type: "sourceText", value: "captured before the debounce" });
+            await sleep(240);
+            check(
+              "a pending debounced send is cancelled by the capture",
+              sent.slice(beforePending).indexOf("pending typing that must not be sent") === -1,
+              { sent: sent.slice(beforePending) }
+            );
+            check(
+              "the cancelled send cannot overwrite the captured text",
+              input.value === "captured before the debounce",
+              { value: input.value }
+            );
+
+            // A late echo of our own send must not clobber newer typing.
+            typeInto("first");
+            await sleep(150);
+            var beforeEcho = sent.length;
+            typeInto("second, newer typing");
+            mock.emit({ type: "sourceText", value: "first" });
+            await sleep(40);
+            check(
+              "an echo of our own send does not clobber newer typing",
+              input.value === "second, newer typing",
+              { value: input.value, sent: sent.slice(beforeEcho) }
+            );
+            await sleep(160);
+
+            // -- Defect E: clearing a file job restores the drop zone ----------
+            mock.emit({ type: "tab", value: "files" });
+            mock.emit({
+              type: "fileJob",
+              value: {
+                path: "C:\\Docs\\quarterly-report.pdf",
+                name: "quarterly-report.pdf",
+                kind: "pdf",
+                size: 1284000,
+                state: "done",
+                completed: 11,
+                total: 11,
+                percent: 100,
+                output: "C:\\Docs\\quarterly-report_uk.pdf",
+                resultName: "quarterly-report_uk.pdf",
+                message: null,
+                warnings: 2,
+                fallback: false,
+                fallbackLabel: "",
+                saveError: null,
+              },
+            });
+            await sleep(50);
+            check("a finished job hides the drop zone", dropZone.hidden === true);
+            check("a finished job shows the job card", fileSelected.hidden === false);
+
+            mock.emit({ type: "fileJob", value: null });
+            await sleep(50);
+            check("clearing restores the drop zone", dropZone.hidden === false);
+            check("clearing hides the job card", fileSelected.hidden === true);
+            check(
+              "clearing leaves no job in the UI model",
+              ui.currentState().fileJob === null,
+              { fileJob: ui.currentState().fileJob }
+            );
+
+            // Defence in depth: an empty or path-less payload is not a job.
+            mock.emit({ type: "fileJob", value: { name: "ghost", state: "" } });
+            await sleep(50);
+            check(
+              "an empty job object is normalised to null",
+              ui.currentState().fileJob === null,
+              { fileJob: ui.currentState().fileJob }
+            );
+            check("an empty job keeps the drop zone visible", dropZone.hidden === false);
+
+            mock.emit({ type: "fileJob", value: { path: "", state: "translating" } });
+            await sleep(50);
+            check(
+              "a job payload without a path is normalised to null",
+              ui.currentState().fileJob === null,
+              { fileJob: ui.currentState().fileJob }
+            );
+
+            // A failed job must offer a retry that really starts the next one.
+            mock.emit({
+              type: "fileJob",
+              value: {
+                path: "C:\\Docs\\scan.pdf",
+                name: "scan.pdf",
+                kind: "pdf",
+                size: 4820000,
+                state: "failed",
+                completed: 0,
+                total: 0,
+                percent: 0,
+                message: "No selectable text found.",
+                warnings: 0,
+                fallback: false,
+                fallbackLabel: "",
+                saveError: null,
+              },
+            });
+            await sleep(50);
+            check("a failed job offers retry", retry.hidden === false);
+            retry.click();
+            await sleep(150);
+            var retried = ui.currentState().fileJob;
+            check(
+              "retry starts a second job",
+              !!retried && retried.path === "C:\\Docs\\scan.pdf" && retried.state !== "failed",
+              retried
+            );
+            check("a starting job hides the drop zone", dropZone.hidden === true);
+
+            await mock.invoke("clear_file_job");
+            await sleep(80);
+            check(
+              "clearing a starting job leaves no ghost",
+              ui.currentState().fileJob === null && dropZone.hidden === false,
+              { fileJob: ui.currentState().fileJob, dropZoneHidden: dropZone.hidden }
+            );
+
+            finish();
+          })().catch(function (error) {
+            finish(error);
+          });
+        });
+      })();
+    </script>
+  </body>
+</html>

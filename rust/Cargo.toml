@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+# The desktop shell needs Tauri and the platform WebView libraries, which are not
+# available in a bare CI container. Everything else must build and test anywhere.
+default-members = [
+    "crates/i18n",
+    "crates/text",
+    "crates/config",
+    "crates/platform",
+    "crates/net",
+    "crates/docs",
+    "crates/store",
+    "crates/app",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "2.0.1"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+repository = "https://github.com/Lexus2016/deepl-on-free-models"
+authors = ["DeepL-oFM contributors"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+
+# Ship small, fast binaries: the release build is what users download.
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Debug builds are for agents and tests, not for humans: with full debug info
+# target/ passed 10 GiB and filled a 436 GiB disk. debug = 0 keeps symbols out
+# of rlibs and test binaries; strip is a no-op then but states the intent.
+[profile.dev]
+debug = 0
+strip = "debuginfo"
+
+# Dependencies are the bulk of the tree; they need no line tables either.
+[profile.dev.package."*"]
+debug = 0

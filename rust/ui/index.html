@@ -1,0 +1,1137 @@
+<!doctype html>
+<html lang="en" data-theme="auto">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>DeepL-oFM</title>
+  <!-- A same-origin file, not an inline script: the shell's CSP forbids inline. -->
+  <script src="boot.js"></script>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- Icon sprite ------------------------------------------------------- -->
+  <svg class="icon-sprite" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
+    <symbol id="i-translate" viewBox="0 0 24 24">
+      <path d="M3.5 5.5h8.2M7.6 3.5v2c0 4.1-2.2 7.9-5.1 9.7"/>
+      <path d="M5 10.4c1.5 3 3.8 5 6.6 6.3"/>
+      <path d="M12.8 20.5 16.7 11h1.6l3.9 9.5"/>
+      <path d="M14.3 17.2h5.4"/>
+    </symbol>
+    <symbol id="i-files" viewBox="0 0 24 24">
+      <path d="M3.5 7.6a2 2 0 0 1 2-2h3.1l2 2.1h7a2 2 0 0 1 2 2v8.7a2 2 0 0 1-2 2h-12a2 2 0 0 1-2-2z"/>
+    </symbol>
+    <symbol id="i-write" viewBox="0 0 24 24">
+      <path d="M4 20.1l4.7-1.2L19 8.6a2.25 2.25 0 0 0-3.2-3.2L5.4 15.6z"/>
+      <path d="M13.9 6.4l3.2 3.2"/>
+    </symbol>
+    <symbol id="i-history" viewBox="0 0 24 24">
+      <path d="M4.2 12a7.8 7.8 0 1 0 2.3-5.5"/>
+      <path d="M4.1 4.5v4.1h4.1"/>
+      <path d="M12 8.2v4.3l3 1.8"/>
+    </symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="3.1"/>
+      <path d="M19.1 14.9a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56v.17a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.11-1.56 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1.03h-.17a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.56-1.11 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.08a1.7 1.7 0 0 0 1.03-1.56v-.17a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.08a1.7 1.7 0 0 0 1.56 1.03h.17a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.56 1.03z"/>
+    </symbol>
+    <symbol id="i-more" viewBox="0 0 24 24">
+      <circle cx="5.5" cy="12" r="1.4" fill="currentColor" stroke="none"/>
+      <circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/>
+      <circle cx="18.5" cy="12" r="1.4" fill="currentColor" stroke="none"/>
+    </symbol>
+    <symbol id="i-globe" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="8.4"/>
+      <path d="M3.6 12h16.8"/>
+      <path d="M12 3.6c2.2 2.3 3.4 5.2 3.4 8.4S14.2 18.1 12 20.4C9.8 18.1 8.6 15.2 8.6 12S9.8 5.9 12 3.6z"/>
+    </symbol>
+    <symbol id="i-speaker" viewBox="0 0 24 24">
+      <path d="M4 9.4h3.2L12 5.6v12.8L7.2 14.6H4z"/>
+      <path d="M15.5 9.1a4.1 4.1 0 0 1 0 5.8"/>
+      <path d="M18.1 6.6a7.7 7.7 0 0 1 0 10.8"/>
+    </symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24">
+      <rect x="6.5" y="6.5" width="11" height="11" rx="2.2"/>
+    </symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24">
+      <rect x="8.6" y="8.6" width="11" height="11" rx="2.2"/>
+      <path d="M15.4 8.6V6.5a2.1 2.1 0 0 0-2.1-2.1H6.5a2.1 2.1 0 0 0-2.1 2.1v6.8a2.1 2.1 0 0 0 2.1 2.1h2.1"/>
+    </symbol>
+    <symbol id="i-clipboard" viewBox="0 0 24 24">
+      <rect x="5.4" y="5.4" width="13.2" height="15.2" rx="2.2"/>
+      <path d="M9.1 5.4V4.2A1.2 1.2 0 0 1 10.3 3h3.4a1.2 1.2 0 0 1 1.2 1.2v1.2"/>
+      <path d="M9 11h6M9 14.6h6"/>
+    </symbol>
+    <symbol id="i-check" viewBox="0 0 24 24">
+      <path d="M4.8 12.6l4.7 4.7L19.2 6.9"/>
+    </symbol>
+    <symbol id="i-x" viewBox="0 0 24 24">
+      <path d="M6 6l12 12M18 6L6 18"/>
+    </symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24">
+      <path d="M2.8 12S6.3 5.8 12 5.8 21.2 12 21.2 12 17.7 18.2 12 18.2 2.8 12 2.8 12z"/>
+      <circle cx="12" cy="12" r="3.1"/>
+    </symbol>
+    <symbol id="i-code" viewBox="0 0 24 24">
+      <path d="M8.4 7.4 3.6 12l4.8 4.6"/>
+      <path d="M15.6 7.4 20.4 12l-4.8 4.6"/>
+      <path d="M13.4 4.8 10.6 19.2"/>
+    </symbol>
+    <symbol id="i-sparkles" viewBox="0 0 24 24">
+      <path d="M10.2 3.6l1.7 4.7 4.7 1.7-4.7 1.7-1.7 4.7-1.7-4.7L3.8 10l4.7-1.7z"/>
+      <path d="M17.8 14.4l.9 2.4 2.4.9-2.4.9-.9 2.4-.9-2.4-2.4-.9 2.4-.9z"/>
+    </symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24">
+      <path d="M20 12a8 8 0 1 1-2.4-5.7"/>
+      <path d="M20 4.2v4.4h-4.4"/>
+    </symbol>
+    <symbol id="i-warning" viewBox="0 0 24 24">
+      <path d="M12 3.9l8.6 15H3.4z"/>
+      <path d="M12 9.4v4.4"/>
+      <circle cx="12" cy="16.6" r=".9" fill="currentColor" stroke="none"/>
+    </symbol>
+    <symbol id="i-download" viewBox="0 0 24 24">
+      <path d="M12 3.8v10.4"/>
+      <path d="M7.6 10.2L12 14.6l4.4-4.4"/>
+      <path d="M4.2 16.4v2.4a1.8 1.8 0 0 0 1.8 1.8h12a1.8 1.8 0 0 0 1.8-1.8v-2.4"/>
+    </symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24">
+      <path d="M3.5 7.6a2 2 0 0 1 2-2h3.1l2 2.1h7a2 2 0 0 1 2 2v8.7a2 2 0 0 1-2 2h-12a2 2 0 0 1-2-2z"/>
+    </symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24">
+      <path d="M4.2 6.8h15.6"/>
+      <path d="M9.2 6.8V4.9a1.2 1.2 0 0 1 1.2-1.2h3.2a1.2 1.2 0 0 1 1.2 1.2v1.9"/>
+      <path d="M6.3 6.8l.8 12.2a1.9 1.9 0 0 0 1.9 1.7h6a1.9 1.9 0 0 0 1.9-1.7l.8-12.2"/>
+      <path d="M10.2 10.6v6M13.8 10.6v6"/>
+    </symbol>
+    <symbol id="i-search" viewBox="0 0 24 24">
+      <circle cx="10.8" cy="10.8" r="6.6"/>
+      <path d="M15.7 15.7l4.2 4.2"/>
+    </symbol>
+    <symbol id="i-chevron-down" viewBox="0 0 24 24">
+      <path d="M6.4 9.4L12 15l5.6-5.6"/>
+    </symbol>
+    <symbol id="i-arrow-right" viewBox="0 0 24 24">
+      <path d="M4.5 12h14.6"/>
+      <path d="M13.7 6.6l5.4 5.4-5.4 5.4"/>
+    </symbol>
+    <symbol id="i-swap" viewBox="0 0 24 24">
+      <path d="M4.2 8.4h14.1"/>
+      <path d="M15 5.1l3.3 3.3-3.3 3.3"/>
+      <path d="M19.8 15.6H5.7"/>
+      <path d="M9 12.3l-3.3 3.3L9 18.9"/>
+    </symbol>
+    <symbol id="i-external" viewBox="0 0 24 24">
+      <path d="M13.4 4.6h6v6"/>
+      <path d="M19.4 4.6l-8.3 8.3"/>
+      <path d="M18.2 13.6v4.5a2 2 0 0 1-2 2H5.9a2 2 0 0 1-2-2V7.8a2 2 0 0 1 2-2h4.5"/>
+    </symbol>
+    <symbol id="i-file" viewBox="0 0 24 24">
+      <path d="M6.4 3.6h7.1l4.1 4.1v12.7H6.4z"/>
+      <path d="M13.5 3.6v4.1h4.1"/>
+    </symbol>
+    <symbol id="i-key" viewBox="0 0 24 24">
+      <circle cx="8.2" cy="8.2" r="4.2"/>
+      <path d="M11.2 11.2l8.4 8.4M16.2 16.2l2.2-2.2M13.9 13.9l2.2-2.2"/>
+    </symbol>
+    <symbol id="i-tone" viewBox="0 0 24 24">
+      <path d="M3.3 12h1.9l1.7-5.4 3.1 10.8 2.2-9.2 1.8 6.2 1.4-2.4h4.3"/>
+    </symbol>
+    <symbol id="i-info" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="8.5"/>
+      <path d="M12 11v5.2"/>
+      <circle cx="12" cy="7.9" r=".9" fill="currentColor" stroke="none"/>
+    </symbol>
+  </svg>
+
+  <div class="app" id="app">
+    <!-- Header ---------------------------------------------------------- -->
+    <header class="app-header">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 28 28">
+            <path d="M5.8 20.6 11.2 7.4h2.7l5.4 13.2"/>
+            <path d="M8.4 15.8h8.3"/>
+            <path d="M20.4 5.6h4.4M22.7 3.3l2.3 2.3-2.3 2.3"/>
+          </svg>
+        </span>
+        <span class="brand-name">DeepL-oFM</span>
+      </div>
+
+      <nav class="tabs" id="tabs" role="tablist" data-i18n-aria="Sections">
+        <button class="tab" type="button" role="tab" id="tab-translate" data-tab="translate" aria-selected="true" aria-controls="pane-translate">
+          <svg class="icon" aria-hidden="true"><use href="#i-translate"></use></svg>
+          <span data-i18n="Translate"></span>
+        </button>
+        <button class="tab" type="button" role="tab" id="tab-files" data-tab="files" aria-selected="false" aria-controls="pane-files" tabindex="-1">
+          <svg class="icon" aria-hidden="true"><use href="#i-files"></use></svg>
+          <span data-i18n="Files"></span>
+        </button>
+        <button class="tab" type="button" role="tab" id="tab-write" data-tab="write" aria-selected="false" aria-controls="pane-write" tabindex="-1">
+          <svg class="icon" aria-hidden="true"><use href="#i-write"></use></svg>
+          <span data-i18n="Write"></span>
+        </button>
+        <button class="tab" type="button" role="tab" id="tab-history" data-tab="history" aria-selected="false" aria-controls="pane-history" tabindex="-1">
+          <svg class="icon" aria-hidden="true"><use href="#i-history"></use></svg>
+          <span data-i18n="History"></span>
+        </button>
+      </nav>
+
+      <div class="header-actions">
+        <button class="conn-capsule" type="button" id="connCapsule" data-i18n-title="Connection status" aria-describedby="connCapsuleLabel">
+          <span class="status-dot" id="connDot" data-state="unknown"></span>
+          <span class="conn-label" id="connCapsuleLabel"></span>
+        </button>
+        <button class="icon-btn" type="button" id="settingsBtn" data-i18n-aria="Settings" data-i18n-title="Settings">
+          <svg class="icon" aria-hidden="true"><use href="#i-settings"></use></svg>
+        </button>
+        <div class="menu-wrap">
+          <button class="icon-btn" type="button" id="moreBtn" data-i18n-aria="More actions" data-i18n-title="More actions" aria-haspopup="menu" aria-expanded="false" aria-controls="moreMenu">
+            <svg class="icon" aria-hidden="true"><use href="#i-more"></use></svg>
+          </button>
+          <div class="menu" id="moreMenu" role="menu" hidden>
+            <button class="menu-item" type="button" role="menuitem" data-command="translate_clipboard">
+              <span class="menu-label" data-i18n="Translate clipboard"></span>
+              <span class="menu-key"></span>
+            </button>
+            <button class="menu-item" type="button" role="menuitem" data-command="translate_selection">
+              <span class="menu-label" data-i18n="Translate selection"></span>
+              <span class="menu-key"></span>
+            </button>
+            <div class="menu-separator" role="separator"></div>
+            <button class="menu-item" type="button" role="menuitem" data-command="check_connection">
+              <span class="menu-label" data-i18n="Check connection"></span>
+            </button>
+            <button class="menu-item" type="button" role="menuitem" data-command="history">
+              <span class="menu-label" data-i18n="History"></span>
+            </button>
+            <div class="menu-separator" role="separator"></div>
+            <button class="menu-item" type="button" role="menuitem" data-command="clear_source">
+              <span class="menu-label" data-i18n="New translation"></span>
+            </button>
+            <button class="menu-item" type="button" role="menuitem" data-command="open_settings">
+              <span class="menu-label" data-i18n="Settings…"></span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main ------------------------------------------------------------ -->
+    <main class="app-main">
+      <!-- Translate ----------------------------------------------------- -->
+      <section class="pane pane-translate" id="pane-translate" role="tabpanel" aria-labelledby="tab-translate">
+        <div class="translate-top" id="translateTop">
+          <div class="bar-spacer" aria-hidden="true"></div>
+          <div class="lang-bar">
+            <div class="select-wrap lang-source">
+              <select id="sourceLang" data-i18n-aria="Source language"></select>
+              <svg class="icon select-chevron" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+            </div>
+            <button class="icon-btn swap-btn" type="button" id="swapBtn" data-i18n-aria="Swap languages" data-i18n-title="Swap languages">
+              <svg class="icon" aria-hidden="true"><use href="#i-swap"></use></svg>
+            </button>
+            <div class="select-wrap lang-target">
+              <select id="targetLang" data-i18n-aria="Target language"></select>
+              <svg class="icon select-chevron" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+            </div>
+          </div>
+
+          <div class="chips-bar" id="chipsBar">
+            <div class="chips-full" id="chipsFull">
+              <span class="caption" data-i18n="Style"></span>
+              <div class="segmented" id="styleChips" role="group" data-i18n-aria="Style">
+                <button class="segment" type="button" data-style="auto" data-i18n="Auto"></button>
+                <button class="segment" type="button" data-style="literal" data-i18n="Literal"></button>
+                <button class="segment" type="button" data-style="natural" data-i18n="Natural"></button>
+              </div>
+              <span class="caption caption-tone" data-i18n="Tone"></span>
+              <div class="segmented" id="toneChips" role="group" data-i18n-aria="Tone">
+                <button class="segment" type="button" data-tone="standard" data-i18n="Default"></button>
+                <button class="segment" type="button" data-tone="formal" data-i18n="Formal"></button>
+                <button class="segment" type="button" data-tone="casual" data-i18n="Casual"></button>
+              </div>
+            </div>
+            <div class="chips-compact" id="chipsCompact" hidden>
+              <div class="compact-control">
+                <span class="compact-glyph" aria-hidden="true">Aa</span>
+                <div class="select-wrap">
+                  <select id="styleCompact" data-i18n-aria="Style"></select>
+                  <svg class="icon select-chevron" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+                </div>
+              </div>
+              <div class="compact-control">
+                <svg class="icon compact-glyph" aria-hidden="true"><use href="#i-tone"></use></svg>
+                <div class="select-wrap">
+                  <select id="toneCompact" data-i18n-aria="Tone"></select>
+                  <svg class="icon select-chevron" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panes">
+          <section class="card source-card" aria-labelledby="sourceTitle">
+            <header class="card-head">
+              <div class="card-title">
+                <svg class="icon" aria-hidden="true"><use href="#i-globe"></use></svg>
+                <h2 id="sourceTitle" data-i18n="Source"></h2>
+              </div>
+              <div class="card-tools">
+                <span class="counter" id="sourceCounter"></span>
+                <button class="icon-btn" type="button" id="sourcePreviewBtn" data-i18n-aria="Show rendered Markdown" data-i18n-title="Show rendered Markdown">
+                  <svg class="icon" aria-hidden="true"><use href="#i-eye"></use></svg>
+                </button>
+                <button class="icon-btn" type="button" id="speakSourceBtn" data-i18n-aria="Listen to the original" data-i18n-title="Listen to the original">
+                  <svg class="icon" aria-hidden="true"><use href="#i-speaker"></use></svg>
+                </button>
+                <button class="icon-btn" type="button" id="pasteBtn" data-i18n-aria="Paste from clipboard" data-i18n-title="Paste from clipboard">
+                  <svg class="icon" aria-hidden="true"><use href="#i-clipboard"></use></svg>
+                </button>
+                <button class="icon-btn" type="button" id="copySourceBtn" data-i18n-aria="Copy the original" data-i18n-title="Copy the original">
+                  <svg class="icon" aria-hidden="true"><use href="#i-copy"></use></svg>
+                </button>
+                <button class="icon-btn" type="button" id="clearSourceBtn" data-i18n-aria="Clear" data-i18n-title="Clear">
+                  <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+                </button>
+              </div>
+            </header>
+            <div class="card-body source-body">
+              <textarea id="sourceInput" class="source-input" spellcheck="false" data-i18n-placeholder="Enter or paste text…" data-i18n-aria="Source"></textarea>
+              <div class="markdown-body source-preview" id="sourcePreview" hidden aria-live="polite"></div>
+            </div>
+          </section>
+
+          <section class="card result-card" aria-labelledby="resultTitle">
+            <header class="card-head">
+              <div class="card-title">
+                <svg class="icon icon-accent" aria-hidden="true"><use href="#i-sparkles"></use></svg>
+                <h2 id="resultTitle" data-i18n="Translation"></h2>
+              </div>
+              <div class="card-tools">
+                <span class="pill pill-warning" id="warningPill" hidden></span>
+                <button class="icon-btn" type="button" id="againBtn" data-i18n-aria="Translate again" data-i18n-title="Translate again">
+                  <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+                </button>
+                <button class="icon-btn" type="button" id="speakResultBtn" data-i18n-aria="Listen to the translation" data-i18n-title="Listen to the translation">
+                  <svg class="icon" aria-hidden="true"><use href="#i-speaker"></use></svg>
+                </button>
+                <button class="btn btn-outline-accent btn-sm" type="button" id="copyBtn" data-i18n-title="Copy translation">
+                  <svg class="icon" aria-hidden="true"><use href="#i-copy"></use></svg>
+                  <span id="copyBtnLabel" data-i18n="Copy"></span>
+                </button>
+              </div>
+            </header>
+
+            <div class="result-controls">
+              <div class="segmented segmented-subtle" id="viewSwitch" role="group" data-i18n-aria="Translation">
+                <button class="segment" type="button" data-view="preview" data-i18n="Preview"></button>
+                <button class="segment" type="button" data-view="text" data-i18n="Text only"></button>
+                <button class="segment" type="button" data-view="markdown" data-i18n="Markdown"></button>
+              </div>
+              <span class="counter" id="resultCounter"></span>
+            </div>
+
+            <div class="card-body result-body">
+              <div class="result-scroll" id="resultScroll">
+                <div class="markdown-body" id="resultView" aria-live="polite"></div>
+
+                <div class="empty-state" id="resultEmpty">
+                  <span class="empty-icon" aria-hidden="true">
+                    <svg class="icon" aria-hidden="true"><use href="#i-sparkles"></use></svg>
+                  </span>
+                  <h3 data-i18n="Translation will appear here"></h3>
+                  <p data-i18n="Press Ctrl + Enter to translate."></p>
+                  <button class="btn btn-primary btn-sm" type="button" id="translateNowBtn">
+                    <svg class="icon" aria-hidden="true"><use href="#i-arrow-right"></use></svg>
+                    <span data-i18n="Translate now"></span>
+                  </button>
+                </div>
+
+                <div class="progress-state" id="resultProgress" hidden>
+                  <h3 id="progressTitle" data-i18n="Translating…"></h3>
+                  <div class="progress-track" id="progressTrack" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-labelledby="progressTitle">
+                    <div class="progress-fill" id="progressFill"></div>
+                  </div>
+                  <div class="progress-counts">
+                    <span id="progressStatus"></span>
+                    <span class="progress-percent" id="progressPercent">0%</span>
+                  </div>
+                  <button class="btn btn-secondary btn-sm" type="button" id="stopBtn">
+                    <svg class="icon" aria-hidden="true"><use href="#i-stop"></use></svg>
+                    <span data-i18n="Stop"></span>
+                  </button>
+                </div>
+
+                <div class="empty-state error-state" id="resultError" hidden>
+                  <span class="empty-icon error-icon" aria-hidden="true">
+                    <svg class="icon" aria-hidden="true"><use href="#i-warning"></use></svg>
+                  </span>
+                  <h3 data-i18n="Translation failed"></h3>
+                  <p id="errorText"></p>
+                  <button class="btn btn-primary btn-sm" type="button" id="retryBtn">
+                    <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+                    <span data-i18n="Retry"></span>
+                  </button>
+                </div>
+              </div>
+
+              <div class="error-banner" id="errorBanner" hidden>
+                <svg class="icon" aria-hidden="true"><use href="#i-warning"></use></svg>
+                <span id="bannerText"></span>
+                <button class="link-btn" type="button" id="bannerRetry" data-i18n="Retry"></button>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <footer class="translate-foot">
+          <span class="detected" id="detectedWrap" hidden>
+            <svg class="icon" aria-hidden="true"><use href="#i-globe"></use></svg>
+            <span id="detectedLabel"></span>
+          </span>
+          <span class="copy-feedback" id="copyFeedback" role="status" hidden></span>
+          <div class="foot-right">
+            <span class="pill pill-warning" id="fallbackPill" hidden data-i18n="fallback"></span>
+            <span class="model-label" id="modelLabel"></span>
+            <span class="dot-sep" id="metricSep" aria-hidden="true">·</span>
+            <span class="metrics" id="metricsLabel"></span>
+          </div>
+        </footer>
+      </section>
+
+      <!-- Files --------------------------------------------------------- -->
+      <section class="pane pane-page" id="pane-files" role="tabpanel" aria-labelledby="tab-files" hidden>
+        <div class="page page-narrow">
+          <header class="page-head">
+            <h1 data-i18n="Files"></h1>
+            <p data-i18n="Translate a document and save the result in its original format."></p>
+          </header>
+
+          <div class="card drop-card" id="dropZone">
+            <span class="drop-icon" aria-hidden="true">
+              <svg class="icon" aria-hidden="true"><use href="#i-file"></use></svg>
+            </span>
+            <h2 data-i18n="Drop a file here or choose one"></h2>
+            <p data-i18n="Supported formats: TXT, Markdown, PDF and DOCX."></p>
+            <button class="btn btn-secondary" type="button" id="chooseFileBtn" data-i18n="Choose a file…"></button>
+          </div>
+
+          <div class="card file-card" id="fileSelected" hidden>
+            <span class="file-icon" aria-hidden="true"><svg class="icon" aria-hidden="true"><use href="#i-file"></use></svg></span>
+            <div class="file-meta">
+              <span class="file-name" id="fileSelectedName"></span>
+              <span class="file-sub" id="fileSelectedMeta"></span>
+            </div>
+            <button class="icon-btn" type="button" id="removeFileBtn" data-i18n-aria="Remove file" data-i18n-title="Remove file">
+              <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+            </button>
+          </div>
+
+          <div class="file-actions" id="fileActions" hidden>
+            <label class="inline-label" for="fileTarget" data-i18n="Translate to"></label>
+            <div class="select-wrap">
+              <select id="fileTarget"></select>
+              <svg class="icon select-chevron" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+            </div>
+            <span class="spacer"></span>
+            <button class="btn btn-primary" type="button" id="translateFileBtn">
+              <svg class="icon" aria-hidden="true"><use href="#i-translate"></use></svg>
+              <span data-i18n="Translate"></span>
+            </button>
+          </div>
+
+          <div class="card file-progress" id="fileProgress" hidden>
+            <header class="file-progress-head">
+              <div>
+                <h3 data-i18n="Translating…"></h3>
+                <p class="file-sub" id="fileProgressName"></p>
+              </div>
+              <span class="progress-percent" id="fileProgressPercent">0%</span>
+            </header>
+            <div class="progress-track" id="fileProgressTrack" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" data-i18n-aria="Translation progress">
+              <div class="progress-fill" id="fileProgressFill"></div>
+            </div>
+            <div class="file-progress-foot">
+              <span class="muted" id="fileProgressState"></span>
+              <button class="btn btn-secondary btn-sm" type="button" id="cancelFileBtn" data-i18n="Cancel"></button>
+            </div>
+          </div>
+
+          <div class="card file-result" id="fileResult" hidden>
+            <div class="result-head">
+              <span class="result-check" aria-hidden="true"><svg class="icon" aria-hidden="true"><use href="#i-check"></use></svg></span>
+              <div class="result-head-text">
+                <h3 data-i18n="Translation complete"></h3>
+                <p class="file-sub mono" id="fileResultName"></p>
+              </div>
+            </div>
+            <p class="warning-line" id="fileWarnings" hidden></p>
+            <p class="warning-line" id="fileFallback" hidden data-i18n="Fallback"></p>
+            <p class="error-line" id="fileSaveError" hidden></p>
+            <div class="result-actions">
+              <button class="btn btn-primary btn-sm" type="button" id="saveFileBtn">
+                <svg class="icon" aria-hidden="true"><use href="#i-download"></use></svg>
+                <span data-i18n="Save file…"></span>
+              </button>
+              <button class="btn btn-secondary btn-sm" type="button" id="showFolderBtn">
+                <svg class="icon" aria-hidden="true"><use href="#i-folder"></use></svg>
+                <span data-i18n="Show in folder"></span>
+              </button>
+              <span class="spacer"></span>
+              <button class="link-btn" type="button" id="anotherFileBtn" data-i18n="Translate another file"></button>
+            </div>
+          </div>
+
+          <div class="card file-error" id="fileError" hidden>
+            <span class="result-check error-check" aria-hidden="true"><svg class="icon" aria-hidden="true"><use href="#i-warning"></use></svg></span>
+            <div class="result-head-text">
+              <h3 data-i18n="The file could not be translated."></h3>
+              <p class="error-line" id="fileErrorText"></p>
+            </div>
+            <div class="file-error-actions">
+              <button class="btn btn-primary btn-sm" type="button" id="fileTryAgainBtn">
+                <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+                <span data-i18n="Try again"></span>
+              </button>
+              <button class="btn btn-secondary btn-sm" type="button" id="fileRetryBtn" data-i18n="Choose a file…"></button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Write --------------------------------------------------------- -->
+      <section class="pane pane-page" id="pane-write" role="tabpanel" aria-labelledby="tab-write" hidden>
+        <div class="page page-write">
+          <header class="page-head">
+            <h1 data-i18n="Improve text"></h1>
+            <p data-i18n="Improve clarity, grammar and style while keeping the meaning."></p>
+          </header>
+
+          <div class="card write-bar">
+            <label class="inline-label" for="writeTarget" data-i18n="Improve in"></label>
+            <div class="select-wrap">
+              <select id="writeTarget"></select>
+              <svg class="icon select-chevron" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+            </div>
+            <button class="btn btn-primary" type="button" id="improveBtn">
+              <svg class="icon" aria-hidden="true"><use href="#i-sparkles"></use></svg>
+              <span class="busy-label" id="improveLabel" data-i18n="Improve text"></span>
+              <span class="spinner" aria-hidden="true" hidden></span>
+            </button>
+            <button class="btn btn-secondary" type="button" id="cancelWriteBtn" hidden data-i18n="Cancel"></button>
+            <span class="spacer"></span>
+            <button class="btn btn-secondary btn-sm" type="button" id="copyWriteBtn" data-i18n-title="Copy translation">
+              <svg class="icon" aria-hidden="true"><use href="#i-copy"></use></svg>
+              <span data-i18n="Copy"></span>
+            </button>
+          </div>
+
+          <div class="panes write-panes">
+            <section class="card source-card" aria-labelledby="writeSourceTitle">
+              <header class="card-head">
+                <div class="card-title">
+                  <svg class="icon" aria-hidden="true"><use href="#i-write"></use></svg>
+                  <h2 id="writeSourceTitle" data-i18n="Source"></h2>
+                </div>
+                <div class="card-tools">
+                  <span class="counter" id="writeCounter"></span>
+                  <button class="icon-btn" type="button" id="clearWriteBtn" data-i18n-aria="Clear" data-i18n-title="Clear">
+                    <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+                  </button>
+                </div>
+              </header>
+              <div class="card-body source-body">
+                <textarea id="writeInput" class="source-input" spellcheck="false" data-i18n-placeholder="Type or paste text to improve" data-i18n-aria="Source"></textarea>
+              </div>
+            </section>
+
+            <section class="card result-card" aria-labelledby="writeResultTitle">
+              <header class="card-head">
+                <div class="card-title">
+                  <svg class="icon icon-accent" aria-hidden="true"><use href="#i-sparkles"></use></svg>
+                  <h2 id="writeResultTitle" data-i18n="Result"></h2>
+                </div>
+                <div class="card-tools">
+                  <span class="counter" id="writeResultCounter"></span>
+                </div>
+              </header>
+              <div class="result-controls">
+                <div class="segmented segmented-subtle" id="writeViewSwitch" role="group" data-i18n-aria="Result">
+                  <button class="segment" type="button" data-view="preview" data-i18n="Preview"></button>
+                  <button class="segment" type="button" data-view="text" data-i18n="Text only"></button>
+                  <button class="segment" type="button" data-view="markdown" data-i18n="Markdown"></button>
+                </div>
+                <span class="duration" id="writeDuration"></span>
+              </div>
+              <div class="card-body result-body">
+                <div class="result-scroll">
+                  <div class="markdown-body" id="writeResultView" aria-live="polite"></div>
+                  <p class="warning-line write-warning" id="writeWarnings" role="status" hidden></p>
+                  <div class="empty-state" id="writeEmpty">
+                    <span class="empty-icon" aria-hidden="true">
+                      <svg class="icon" aria-hidden="true"><use href="#i-sparkles"></use></svg>
+                    </span>
+                    <h3 data-i18n="Improved text will appear here"></h3>
+                    <p data-i18n="Type or paste text on the left to begin."></p>
+                  </div>
+                  <div class="empty-state busy-state" id="writeBusyState" hidden>
+                    <span class="empty-icon" aria-hidden="true">
+                      <span class="spinner spinner-lg"></span>
+                    </span>
+                    <h3 data-i18n="Improving…"></h3>
+                    <p data-i18n="This usually takes a few seconds."></p>
+                  </div>
+                  <div class="empty-state error-state" id="writeError" hidden>
+                    <span class="empty-icon error-icon" aria-hidden="true">
+                      <svg class="icon" aria-hidden="true"><use href="#i-warning"></use></svg>
+                    </span>
+                    <h3 data-i18n="Translation failed"></h3>
+                    <p id="writeErrorText"></p>
+                  </div>
+                </div>
+              </div>
+            </section>
+          </div>
+        </div>
+      </section>
+
+      <!-- History ------------------------------------------------------- -->
+      <section class="pane pane-page" id="pane-history" role="tabpanel" aria-labelledby="tab-history" hidden>
+        <div class="page page-history">
+          <header class="page-head page-head-row">
+            <div class="page-head-text">
+              <h1><span data-i18n="History"></span> <span class="count-badge" id="historyCount">0</span></h1>
+            </div>
+            <div class="history-tools">
+              <div class="search-field">
+                <svg class="icon" aria-hidden="true"><use href="#i-search"></use></svg>
+                <input type="search" id="historySearch" data-i18n-placeholder="Search in history" data-i18n-aria="Search in history">
+              </div>
+              <button class="btn btn-secondary" type="button" id="historyClearBtn">
+                <svg class="icon" aria-hidden="true"><use href="#i-trash"></use></svg>
+                <span data-i18n="Clear"></span>
+              </button>
+            </div>
+          </header>
+
+          <div class="card history-card">
+            <div class="empty-state" id="historyEmpty">
+              <span class="empty-icon" aria-hidden="true">
+                <svg class="icon" aria-hidden="true"><use href="#i-history"></use></svg>
+              </span>
+              <h3 id="historyEmptyTitle" data-i18n="History is empty"></h3>
+              <p id="historyEmptyText" data-i18n="Translations will be saved here automatically."></p>
+            </div>
+            <div class="history-list" id="historyList"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Status bar ------------------------------------------------------ -->
+    <footer class="status-bar">
+      <span class="status-dot" id="statusDot" data-state="unknown" aria-hidden="true"></span>
+      <span class="status-text" id="statusText"></span>
+      <span class="status-error" id="statusError"></span>
+      <span class="spacer"></span>
+      <button class="link-btn stop-speaking" type="button" id="stopSpeaking" hidden data-i18n="Stop"></button>
+      <span class="status-metrics" id="statusMetrics"></span>
+    </footer>
+  </div>
+
+  <!-- Settings dialog --------------------------------------------------- -->
+  <dialog class="dialog dialog-settings" id="settingsDialog" aria-labelledby="settingsTitle">
+    <div class="dialog-shell" tabindex="-1">
+      <header class="dialog-head">
+        <h2 id="settingsTitle" data-i18n="Settings"></h2>
+        <span class="dialog-version" id="settingsVersion"></span>
+      </header>
+
+      <div class="dialog-tabs" id="settingsTabs" role="tablist" data-i18n-aria="Settings">
+        <button class="dialog-tab is-active" type="button" role="tab" data-settings-tab="model" id="settingsTab-model" aria-controls="settingsPanel-model" aria-selected="true" data-i18n="Model &amp; provider"></button>
+        <button class="dialog-tab" type="button" role="tab" data-settings-tab="generation" id="settingsTab-generation" aria-controls="settingsPanel-generation" aria-selected="false" tabindex="-1" data-i18n="Generation"></button>
+        <button class="dialog-tab" type="button" role="tab" data-settings-tab="behaviour" id="settingsTab-behaviour" aria-controls="settingsPanel-behaviour" aria-selected="false" tabindex="-1" data-i18n="Behavior"></button>
+        <button class="dialog-tab" type="button" role="tab" data-settings-tab="hotkeys" id="settingsTab-hotkeys" aria-controls="settingsPanel-hotkeys" aria-selected="false" tabindex="-1" data-i18n="Hot keys"></button>
+        <button class="dialog-tab" type="button" role="tab" data-settings-tab="about" id="settingsTab-about" aria-controls="settingsPanel-about" aria-selected="false" tabindex="-1" data-i18n="About"></button>
+      </div>
+
+      <div class="dialog-body" id="settingsBody">
+        <!-- Model & provider -->
+        <section class="settings-panel" data-settings-panel="model" id="settingsPanel-model" role="tabpanel" aria-labelledby="settingsTab-model">
+          <section class="card settings-card">
+            <header class="section-head">
+              <h3 data-i18n="Model and provider"></h3>
+              <p data-i18n="Local models run offline and for free. Cloud models answer faster but need a key."></p>
+            </header>
+            <div class="form">
+              <div class="form-row">
+                <label class="form-label" for="providerSelect" data-i18n="Provider"></label>
+                <div class="form-control">
+                  <div class="select-wrap">
+                    <select id="providerSelect"></select>
+                    <svg class="icon select-chevron" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+                  </div>
+                  <p class="hint" id="providerHint"></p>
+                </div>
+              </div>
+
+              <div class="form-row">
+                <label class="form-label" for="baseUrlInput" data-i18n="Server address"></label>
+                <div class="form-control">
+                  <input type="text" id="baseUrlInput" spellcheck="false" autocomplete="off">
+                </div>
+              </div>
+
+              <div class="form-row">
+                <label class="form-label" for="apiKeyInput" data-i18n="API key"></label>
+                <div class="form-control">
+                  <div class="input-with-actions">
+                    <input type="password" id="apiKeyInput" spellcheck="false" autocomplete="off">
+                    <button class="link-btn" type="button" id="revealKeyBtn" data-i18n="Show"></button>
+                    <button class="link-btn" type="button" id="keyLink" hidden data-i18n="Get key ↗"></button>
+                  </div>
+                  <p class="hint" id="apiKeyHint" data-i18n="Can be empty for local servers. Stored securely on this computer."></p>
+                </div>
+              </div>
+
+              <div class="form-row">
+                <label class="form-label" for="modelInput" data-i18n="Model"></label>
+                <div class="form-control">
+                  <div class="input-with-actions">
+                    <input type="text" id="modelInput" spellcheck="false" autocomplete="off" data-i18n-placeholder="Choose model">
+                    <button class="btn btn-secondary btn-sm" type="button" id="catalogBtn">
+                      <svg class="icon" aria-hidden="true"><use href="#i-sparkles"></use></svg>
+                      <span data-i18n="Model catalog…"></span>
+                    </button>
+                  </div>
+                  <div class="install-hint" id="installHint" hidden>
+                    <span class="install-hint-label" data-i18n="Install command"></span>
+                    <code class="install-hint-code" id="installCommand"></code>
+                    <button class="link-btn" type="button" id="installCopyBtn">
+                      <span data-i18n="Copy"></span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="form-row form-row-actions">
+                <span class="form-label" aria-hidden="true"></span>
+                <div class="form-control inline-actions">
+                  <button class="btn btn-secondary" type="button" id="connectBtn">
+                    <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+                    <span data-i18n="Connect"></span>
+                  </button>
+                  <span class="connection-state" id="connectStatus"></span>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="card settings-card">
+            <header class="section-head section-head-row">
+              <h3 data-i18n="Models on the server"></h3>
+              <span class="muted" id="modelsCount"></span>
+            </header>
+            <div class="search-field">
+              <svg class="icon" aria-hidden="true"><use href="#i-search"></use></svg>
+              <input type="search" id="modelFilter" data-i18n-placeholder="Filter by name" data-i18n-aria="Filter by name">
+            </div>
+            <div class="model-list" id="modelList" role="listbox" data-i18n-aria="Models on the server"></div>
+            <p class="hint" id="modelsHint" data-i18n="Select a model from the list or type its ID."></p>
+          </section>
+
+          <section class="card settings-card">
+            <header class="section-head">
+              <h3 data-i18n="Fallback provider"></h3>
+              <p data-i18n="Used automatically when the primary provider fails."></p>
+            </header>
+            <label class="switch-row">
+              <span class="switch-row-text" data-i18n="Use a fallback provider"></span>
+              <span class="switch">
+                <input type="checkbox" id="fallbackToggle">
+                <span class="switch-track" aria-hidden="true"></span>
+              </span>
+            </label>
+            <div class="form fallback-body" id="fallbackBody" hidden>
+              <div class="form-row">
+                <label class="form-label" for="fallbackProviderSelect" data-i18n="Provider"></label>
+                <div class="form-control">
+                  <div class="select-wrap">
+                    <select id="fallbackProviderSelect"></select>
+                    <svg class="icon select-chevron" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+                  </div>
+                </div>
+              </div>
+              <div class="form-row">
+                <label class="form-label" for="fallbackBaseInput" data-i18n="Server address"></label>
+                <div class="form-control">
+                  <input type="text" id="fallbackBaseInput" spellcheck="false" autocomplete="off">
+                </div>
+              </div>
+              <div class="form-row">
+                <label class="form-label" for="fallbackKeyInput" data-i18n="API key"></label>
+                <div class="form-control">
+                  <input type="password" id="fallbackKeyInput" spellcheck="false" autocomplete="off">
+                </div>
+              </div>
+              <div class="form-row">
+                <label class="form-label" for="fallbackModelInput" data-i18n="Model"></label>
+                <div class="form-control">
+                  <div class="input-with-actions">
+                    <input type="text" id="fallbackModelInput" spellcheck="false" autocomplete="off" data-i18n-placeholder="Choose a model" list="fallbackModelOptions">
+                    <datalist id="fallbackModelOptions"></datalist>
+                    <button class="btn btn-secondary btn-sm" type="button" id="fallbackLoadBtn">
+                      <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+                      <span data-i18n="Load models"></span>
+                    </button>
+                  </div>
+                  <p class="hint" id="fallbackHint" data-i18n="If the primary provider fails, the same text is retried with these settings."></p>
+                  <p class="connection-state" id="fallbackStatus"></p>
+                </div>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <!-- Generation -->
+        <section class="settings-panel" data-settings-panel="generation" id="settingsPanel-generation" role="tabpanel" aria-labelledby="settingsTab-generation" hidden>
+          <section class="card settings-card">
+            <header class="section-head">
+              <h3 data-i18n="Generation parameters"></h3>
+              <p data-i18n="Defaults match Tencent’s recommendations for Hy-MT2 7B."></p>
+            </header>
+            <div class="sliders">
+              <div class="slider-row">
+                <label class="slider-label" for="temperatureRange" data-i18n="Temperature"></label>
+                <input class="range" type="range" id="temperatureRange" min="0" max="1.5" step="0.05" value="0.7">
+                <output class="slider-value" id="temperatureValue" for="temperatureRange">0.70</output>
+              </div>
+              <div class="slider-row">
+                <label class="slider-label" for="topPRange" data-i18n="Top-p"></label>
+                <input class="range" type="range" id="topPRange" min="0.1" max="1" step="0.05" value="0.6">
+                <output class="slider-value" id="topPValue" for="topPRange">0.60</output>
+              </div>
+              <div class="slider-row">
+                <label class="slider-label" for="topKRange" data-i18n="Top-k"></label>
+                <input class="range" type="range" id="topKRange" min="1" max="100" step="1" value="20">
+                <output class="slider-value" id="topKValue" for="topKRange">20</output>
+              </div>
+              <div class="slider-row">
+                <label class="slider-label" for="repetitionRange" data-i18n="Repetition"></label>
+                <input class="range" type="range" id="repetitionRange" min="1" max="1.5" step="0.01" value="1.05">
+                <output class="slider-value" id="repetitionValue" for="repetitionRange">1.05</output>
+              </div>
+              <div class="slider-row">
+                <label class="slider-label" for="contextRange" data-i18n="Context"></label>
+                <input class="range" type="range" id="contextRange" min="2048" max="32768" step="512" value="8192">
+                <output class="slider-value" id="contextValue" for="contextRange">8 192</output>
+              </div>
+            </div>
+          </section>
+
+          <section class="card settings-card">
+            <header class="section-head">
+              <h3 data-i18n="System prompt"></h3>
+              <p data-i18n="Hy-MT2 has no system prompt: instruction and text go in one message. Wording follows the model card."></p>
+            </header>
+            <div class="prompt-form">
+              <div class="prompt-row">
+                <span class="form-label" data-i18n="Style"></span>
+                <div class="segmented prompt-chips" id="promptStyleChips" role="group" data-i18n-aria="Style">
+                  <button class="segment" type="button" data-style="auto" data-i18n="Auto"></button>
+                  <button class="segment" type="button" data-style="literal" data-i18n="Literal"></button>
+                  <button class="segment" type="button" data-style="natural" data-i18n="Natural"></button>
+                </div>
+              </div>
+              <div class="prompt-row">
+                <span class="form-label" data-i18n="Tone"></span>
+                <div class="segmented prompt-chips" id="promptToneChips" role="group" data-i18n-aria="Tone">
+                  <button class="segment" type="button" data-tone="standard" data-i18n="Default"></button>
+                  <button class="segment" type="button" data-tone="formal" data-i18n="Formal"></button>
+                  <button class="segment" type="button" data-tone="casual" data-i18n="Casual"></button>
+                </div>
+              </div>
+              <div class="prompt-row">
+                <label class="form-label" for="promptTarget" data-i18n="Translate to"></label>
+                <div class="select-wrap prompt-target">
+                  <select id="promptTarget"></select>
+                  <svg class="icon select-chevron" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+                </div>
+              </div>
+              <pre class="prompt-preview" id="promptPreview" aria-live="polite"></pre>
+            </div>
+          </section>
+        </section>
+
+        <!-- Behavior -->
+        <section class="settings-panel" data-settings-panel="behaviour" id="settingsPanel-behaviour" role="tabpanel" aria-labelledby="settingsTab-behaviour" hidden>
+          <section class="card settings-card">
+            <header class="section-head">
+              <h3 data-i18n="Behavior"></h3>
+            </header>
+            <div class="behaviour-list">
+              <label class="switch-row">
+                <span class="switch-row-text" data-i18n="Translate automatically while typing"></span>
+                <span class="switch">
+                  <input type="checkbox" id="autoTranslateToggle">
+                  <span class="switch-track" aria-hidden="true"></span>
+                </span>
+              </label>
+
+              <div class="slider-row slider-row-inline" id="debounceRow">
+                <label class="slider-label" for="debounceRange" data-i18n="Delay"></label>
+                <input class="range" type="range" id="debounceRange" min="0.2" max="2" step="0.05" value="0.45">
+                <output class="slider-value" id="debounceValue" for="debounceRange">0.45 s</output>
+              </div>
+
+              <label class="switch-row">
+                <span class="switch-row-text" data-i18n="Translate text in one request"></span>
+                <span class="switch">
+                  <input type="checkbox" id="translateInOneRequestToggle">
+                  <span class="switch-track" aria-hidden="true"></span>
+                </span>
+              </label>
+
+              <label class="switch-row">
+                <span class="switch-row-text" data-i18n="Keep translation history"></span>
+                <span class="switch">
+                  <input type="checkbox" id="keepHistoryToggle">
+                  <span class="switch-track" aria-hidden="true"></span>
+                </span>
+              </label>
+
+              <div id="loginItem">
+                <label class="switch-row">
+                  <span class="switch-row-text" data-i18n="Open at login"></span>
+                  <span class="switch">
+                    <input type="checkbox" id="loginItemToggle">
+                    <span class="switch-track" aria-hidden="true"></span>
+                  </span>
+                </label>
+                <p class="hotkey-error" id="loginItemError" hidden></p>
+                <div id="loginItemApproval" hidden>
+                  <p class="hint" data-i18n="Allow DeepL-oFM to open at login in System Settings."></p>
+                  <button class="btn btn-secondary btn-sm" type="button" id="loginItemSettings" data-i18n="Open System Settings"></button>
+                </div>
+              </div>
+
+              <label class="switch-row switch-row-hint">
+                <span class="switch-row-label">
+                  <span class="switch-row-text" data-i18n="Load the translator at launch"></span>
+                  <span class="switch-row-sub" data-i18n="Connects to the provider, refreshes the model list and warms up a local model."></span>
+                </span>
+                <span class="switch">
+                  <input type="checkbox" id="warmUpToggle">
+                  <span class="switch-track" aria-hidden="true"></span>
+                </span>
+              </label>
+
+              <div class="divider" role="presentation"></div>
+
+              <div class="field-row">
+                <label class="form-label" for="interfaceLanguageSelect" data-i18n="Interface language"></label>
+                <div class="select-wrap">
+                  <select id="interfaceLanguageSelect"></select>
+                  <svg class="icon select-chevron" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+                </div>
+              </div>
+
+              <label class="switch-row switch-row-hint">
+                <span class="switch-row-label">
+                  <span class="switch-row-text" data-i18n="Tray icon"></span>
+                  <span class="switch-row-sub" data-i18n="Keep DeepL-oFM in the notification area; closing the window then hides it."></span>
+                </span>
+                <span class="switch">
+                  <input type="checkbox" id="trayToggle">
+                  <span class="switch-track" aria-hidden="true"></span>
+                </span>
+              </label>
+
+              <div class="field-row field-row-hint">
+                <label class="form-label" for="voiceSelect" data-i18n="Voice"></label>
+                <div class="field-stack">
+                  <div class="select-wrap">
+                    <select id="voiceSelect"></select>
+                    <svg class="icon select-chevron" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+                  </div>
+                  <p class="hint" data-i18n="More voices can be added in Windows Settings → Time &amp; language → Speech."></p>
+                </div>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <!-- Hot keys -->
+        <section class="settings-panel" data-settings-panel="hotkeys" id="settingsPanel-hotkeys" role="tabpanel" aria-labelledby="settingsTab-hotkeys" hidden>
+          <section class="card settings-card">
+            <header class="section-head">
+              <h3 data-i18n="Hot keys"></h3>
+              <p data-i18n="Work from any application — DeepL-oFM stays out of the way."></p>
+            </header>
+            <div class="hotkey-list">
+              <div class="hotkey-row">
+                <div class="hotkey-text">
+                  <span class="hotkey-title" data-i18n="Translate clipboard"></span>
+                  <p class="hint" data-i18n="Copy text anywhere and press the shortcut — DeepL-oFM opens and translates the clipboard."></p>
+                </div>
+                <div class="hotkey-control">
+                  <button class="hotkey-field" type="button" id="hotkeyStandard" data-hotkey="standard" data-i18n-aria="Hot key"></button>
+                  <button class="link-btn" type="button" id="resetHotkey" data-i18n="Reset"></button>
+                </div>
+              </div>
+              <p class="connection-state" id="hotkeyMessage"></p>
+
+              <div class="hotkey-row">
+                <div class="hotkey-text">
+                  <span class="hotkey-title" data-i18n="Selected text"></span>
+                  <p class="hint" data-i18n="Select text in any app and press the shortcut — DeepL-oFM copies it and translates."></p>
+                </div>
+                <div class="hotkey-control">
+                  <button class="hotkey-field" type="button" id="hotkeySelection" data-hotkey="selection" data-i18n-aria="Selected text"></button>
+                  <button class="link-btn" type="button" id="resetSelectionHotkey" data-i18n="Reset"></button>
+                </div>
+              </div>
+              <p class="connection-state" id="selectionHotkeyMessage"></p>
+
+              <p class="hotkey-error" id="hotkeyError" hidden></p>
+            </div>
+            <p class="hint" id="hotkeyExample" data-i18n="Examples: Ctrl+Alt+T or Ctrl+Alt+C."></p>
+          </section>
+        </section>
+
+        <!-- About -->
+        <section class="settings-panel" data-settings-panel="about" id="settingsPanel-about" role="tabpanel" aria-labelledby="settingsTab-about" hidden>
+          <section class="card settings-card about-card">
+            <div class="about-brand">
+              <span class="brand-mark brand-mark-lg" aria-hidden="true">
+                <svg viewBox="0 0 28 28">
+                  <path d="M5.8 20.6 11.2 7.4h2.7l5.4 13.2"/>
+                  <path d="M8.4 15.8h8.3"/>
+                  <path d="M20.4 5.6h4.4M22.7 3.3l2.3 2.3-2.3 2.3"/>
+                </svg>
+              </span>
+              <h3>DeepL-oFM</h3>
+              <p class="about-version" id="aboutVersion"></p>
+              <p class="about-tagline" data-i18n="A native translator for local and cloud models."></p>
+              <p class="about-meta" data-i18n="MIT license · free and open source."></p>
+            </div>
+            <div class="about-note">
+              <svg class="icon" aria-hidden="true"><use href="#i-info"></use></svg>
+              <p data-i18n="Model: Hy-MT2 7B (Tencent Hy). License and model card on Hugging Face."></p>
+            </div>
+            <div class="about-links">
+              <button class="btn btn-secondary btn-sm" type="button" data-url="https://github.com/Lexus2016/deepl-on-free-models" data-i18n="DeepL-oFM on GitHub"></button>
+              <button class="btn btn-secondary btn-sm" type="button" data-url="https://huggingface.co/tencent/Hy-MT2-7B" data-i18n="Model on Hugging Face"></button>
+            </div>
+            <div class="about-paths">
+              <div class="about-path-row">
+                <span class="about-path-label" data-i18n="Settings file"></span>
+                <span class="about-path-value" id="aboutSettingsPath"></span>
+              </div>
+              <div class="about-path-row">
+                <span class="about-path-label" data-i18n="History file"></span>
+                <span class="about-path-value" id="aboutHistoryPath"></span>
+              </div>
+              <div class="about-path-row">
+                <span class="about-path-label" data-i18n="Key storage"></span>
+                <span class="about-path-value" id="aboutSecretBackend"></span>
+              </div>
+            </div>
+          </section>
+        </section>
+      </div>
+
+      <footer class="dialog-foot">
+        <span class="hint" data-i18n="Changes apply when you save."></span>
+        <div class="dialog-actions">
+          <button class="btn btn-secondary" type="button" id="settingsCancel" data-i18n="Cancel"></button>
+          <button class="btn btn-primary" type="button" id="settingsSave">
+            <svg class="icon" aria-hidden="true"><use href="#i-check"></use></svg>
+            <span data-i18n="Save"></span>
+          </button>
+        </div>
+      </footer>
+    </div>
+  </dialog>
+
+  <!-- Model catalogue dialog -------------------------------------------- -->
+  <dialog class="dialog dialog-catalog" id="catalogDialog" aria-labelledby="catalogTitle">
+    <div class="dialog-shell" tabindex="-1">
+      <header class="dialog-head">
+        <div class="dialog-head-text">
+          <h2 id="catalogTitle" data-i18n="Model catalog"></h2>
+          <p class="dialog-sub" data-i18n="Ready translators for local use and cloud options with free tiers."></p>
+        </div>
+        <span class="dialog-version" id="catalogCount"></span>
+      </header>
+
+      <div class="catalog-toolbar">
+        <div class="select-wrap">
+          <select id="catalogProvider" data-i18n-aria="Provider"></select>
+          <svg class="icon select-chevron" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+        </div>
+        <label class="free-toggle">
+          <span data-i18n="Free only"></span>
+          <span class="switch">
+            <input type="checkbox" id="catalogFree">
+            <span class="switch-track" aria-hidden="true"></span>
+          </span>
+        </label>
+        <div class="search-field">
+          <svg class="icon" aria-hidden="true"><use href="#i-search"></use></svg>
+          <input type="search" id="catalogSearch" data-i18n-placeholder="Search model" data-i18n-aria="Search model">
+        </div>
+        <button class="btn btn-secondary" type="button" id="catalogFetch" data-i18n="Fetch from server"></button>
+      </div>
+
+      <div class="catalog-body" id="catalogBody">
+        <div class="catalog-section" id="catalogServerSection" hidden>
+          <h4><span data-i18n="Found on the server"></span> <span class="catalog-count" id="catalogServerCount"></span></h4>
+          <div class="catalog-list" id="catalogServerList"></div>
+        </div>
+        <div class="catalog-section" id="catalogRecommendedSection">
+          <h4><span data-i18n="Recommended"></span></h4>
+          <div class="catalog-list" id="catalogRecommendedList"></div>
+        </div>
+        <div class="catalog-section" id="catalogModelsSection">
+          <h4><span data-i18n="Models"></span></h4>
+          <div class="catalog-list" id="catalogModelsList"></div>
+        </div>
+        <div class="empty-state" id="catalogEmpty" hidden>
+          <span class="empty-icon" aria-hidden="true">
+            <svg class="icon" aria-hidden="true"><use href="#i-search"></use></svg>
+          </span>
+          <h3 data-i18n="Nothing found"></h3>
+          <p data-i18n="Try another query."></p>
+        </div>
+      </div>
+
+      <footer class="dialog-foot">
+        <span class="hint" data-i18n="Need another model? Type its ID into the Model field — any model your server supports will work."></span>
+        <div class="dialog-actions">
+          <button class="btn btn-secondary" type="button" id="catalogClose" data-i18n="Close"></button>
+        </div>
+      </footer>
+    </div>
+  </dialog>
+
+  <!-- Confirmation dialog ----------------------------------------------- -->
+  <dialog class="dialog dialog-confirm" id="confirmDialog" aria-labelledby="confirmTitle">
+    <div class="confirm-shell">
+      <h2 id="confirmTitle" data-i18n="Clear history?"></h2>
+      <p id="confirmText" data-i18n="All saved translations will be deleted permanently."></p>
+      <div class="confirm-actions">
+        <button class="btn btn-secondary" type="button" id="confirmCancel" data-i18n="Cancel"></button>
+        <button class="btn btn-danger" type="button" id="confirmOk" data-i18n="Clear"></button>
+      </div>
+    </div>
+  </dialog>
+
+  <div class="toast-region" id="toastRegion" role="status" aria-live="polite"></div>
+
+  <script src="strings.js"></script>
+  <script src="mock.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
