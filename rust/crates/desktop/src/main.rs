@@ -331,19 +331,38 @@ fn install_hotkeys(app: &tauri::AppHandle, controller: Arc<AppController>) {
         let mut manager = HotkeyManager::new();
 
         loop {
+            // Windows posts `WM_HOTKEY` to a hidden window created on this
+            // thread by `HotkeyManager::new`; the window procedure (which fills
+            // the channel read by `poll`) only runs while this thread pumps its
+            // message queue.  `poll` itself just drains that channel, so without
+            // the pump the shortcuts register but never fire.  Pumping here is
+            // the correct fix for `global-hotkey`: the crate only requires the
+            // manager and a Win32 message loop to share a thread (not the main
+            // thread), and this thread already owns registration, the settings
+            // channel and dispatch.  Moving the manager to Tauri's main loop
+            // would need an extra timer to poll it and would split that
+            // ownership.  The pump is a no-op on other platforms.
+            ofm_platform::hotkeys::pump_messages();
+
             // Apply pending shortcut changes first, then dispatch presses.
             while let Ok((clipboard, selection)) = changes.try_recv() {
                 apply_shortcuts(&mut manager, &dispatch_controller, &clipboard, &selection);
             }
             for action in manager.poll() {
-                if let Some(window) = dispatch_app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
+                // Capture before activating our own window.  "Translate
+                // selection" synthesises Ctrl+C into whatever is focused, so
+                // showing and focusing DeepL-oFM first would make the capture
+                // copy our own UI (or nothing).  `translate_selection` blocks
+                // until the capture and clipboard wait finish; the window is
+                // brought forward afterwards so the result is visible.
                 match action.as_str() {
                     "clipboard" => dispatch_controller.translate_clipboard(),
                     "selection" => dispatch_controller.translate_selection(),
                     other => log::debug!("unhandled hotkey action: {other}"),
+                }
+                if let Some(window) = dispatch_app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
                 }
             }
             std::thread::sleep(Duration::from_millis(60));

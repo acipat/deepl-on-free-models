@@ -1,12 +1,13 @@
 //! API-key storage.
 //!
-//! Ported from `windows/deepl_ofm/services/secrets.py`. On Windows and macOS a
-//! usable `keyring` backend (Credential Manager / Keychain) is preferred; when
-//! it is missing — or when the crate is built without a platform backend, which
-//! makes `keyring` hand out its in-memory mock — the store falls back to a file:
-//! DPAPI-encrypted `secrets.dat` on Windows, an owner-only `secrets.json`
-//! elsewhere. Read, write and delete never panic: failures are logged and the
-//! caller simply sees an empty key.
+//! Ported from `windows/deepl_ofm/services/secrets.py`. On Windows and macOS the
+//! native `keyring` backend (Credential Manager / Keychain) is compiled in and
+//! preferred, so keys written by the Python port are readable here. When the
+//! platform store is unavailable — or when the crate is built for a target
+//! without a native backend, where `keyring` hands out its in-memory mock — the
+//! store falls back to a file: DPAPI-encrypted `secrets.dat` on Windows, an
+//! owner-only `secrets.json` elsewhere. Read, write and delete never panic:
+//! failures are logged and the caller simply sees an empty key.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -292,6 +293,10 @@ fn file_backend() -> Backend {
 /// forgetting them on exit. The probe therefore rejects anything that is not
 /// persistent and anything whose credential is the mock, then asks for one
 /// entry without touching the store.
+///
+/// `windows-native` and `apple-native` are enabled per target in `Cargo.toml`,
+/// so a Windows or macOS build reaches the Credential Manager / Keychain here
+/// and prefers it over the file fallback.
 fn keyring_is_usable() -> bool {
     static USABLE: OnceLock<bool> = OnceLock::new();
     *USABLE.get_or_init(|| {
@@ -381,8 +386,29 @@ mod tests {
     fn default_backend_name() {
         let store = SecretStore::new();
         assert!(["keyring", "dpapi", "plain"].contains(&store.backend_name()));
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         assert_eq!(store.backend_name(), "plain");
+        // macOS prefers the Keychain; a locked or unavailable keychain is the
+        // only reason it would still use the file.
+        #[cfg(target_os = "macos")]
+        assert_ne!(store.backend_name(), "dpapi");
+    }
+
+    #[test]
+    fn native_targets_compile_a_persistent_keyring_backend() {
+        use keyring::credential::CredentialPersistence;
+
+        let persistence = keyring::default::default_credential_builder().persistence();
+        if cfg!(any(windows, target_os = "macos")) {
+            assert!(
+                matches!(persistence, CredentialPersistence::UntilDelete),
+                "the native keyring backend must persist secrets"
+            );
+        } else {
+            // Linux (and every other target) stays feature-free: the mock is
+            // rejected by the probe and the owner-only file is used.
+            assert!(!matches!(persistence, CredentialPersistence::UntilDelete));
+        }
     }
 
     #[test]

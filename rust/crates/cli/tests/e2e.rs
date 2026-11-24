@@ -177,6 +177,13 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+/// Seed the sandbox settings file the binary will load.
+fn write_settings(sandbox: &Sandbox, document: serde_json::Value) {
+    let path = sandbox.path().join("DeepL-oFM").join("settings.json");
+    std::fs::create_dir_all(path.parent().expect("settings parent")).expect("create settings dir");
+    std::fs::write(&path, document.to_string()).expect("write settings");
+}
+
 // ------------------------------------------------------------------- tests
 
 #[test]
@@ -320,17 +327,135 @@ fn check_succeeds_when_the_model_is_present() {
 }
 
 #[test]
-fn prompt_matches_the_hy_mt2_instruction() {
+fn prompt_preview_shows_the_prompt_the_translator_sends() {
     let sandbox = Sandbox::new("prompt");
-    let output = run_cli(&sandbox, &["prompt", "--text", "Hello", "--target", "uk"]);
+    let output = run_cli(
+        &sandbox,
+        &[
+            "prompt",
+            "--text",
+            "Could you send me the report?",
+            "--source",
+            "en",
+            "--target",
+            "de",
+            "--style",
+            "literal",
+            "--tone",
+            "formal",
+        ],
+    );
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert_eq!(
+        stdout(&output).trim_end(),
+        "The source language is English. Please translate the following text into German. \
+         Note that the translation style must strictly conform to [literal, word for word; \
+         formal and professional]:\n\nCould you send me the report?"
+    );
+}
+
+#[test]
+fn prompt_preview_keeps_the_heading_template_for_markdown_headings() {
+    let sandbox = Sandbox::new("prompt-heading");
+    let output = run_cli(
+        &sandbox,
+        &["prompt", "--text", "## Title", "--target", "uk"],
+    );
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     let text = stdout(&output);
     assert!(
-        text.contains("Translate the following text into Ukrainian"),
+        text.starts_with("Translate this heading into Ukrainian."),
         "prompt: {text}"
     );
-    assert!(text.contains("Hello"), "prompt: {text}");
+    assert!(text.trim_end().ends_with("\n\nTitle"), "prompt: {text}");
+}
+
+#[test]
+fn prompt_preview_uses_the_translate_gemma_instruction() {
+    let sandbox = Sandbox::new("prompt-gemma");
+    let output = run_cli(
+        &sandbox,
+        &[
+            "prompt",
+            "--text",
+            "Hello, world!",
+            "--source",
+            "en",
+            "--target",
+            "de",
+            "--model",
+            "translategemma:4b",
+        ],
+    );
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("You are a professional English (en) to German (de) translator."),
+        "prompt: {text}"
+    );
+    assert!(
+        text.trim_end().ends_with(":\n\n\nHello, world!"),
+        "two blank lines before the text: {text}"
+    );
+}
+
+#[test]
+fn the_stored_base_url_wins_over_the_provider_default() {
+    let server = FakeServer::start(vec![tags_route(&["hy-mt2:7b"])]);
+    let sandbox = Sandbox::new("stored-url");
+    write_settings(
+        &sandbox,
+        serde_json::json!({
+            "provider": "ollama",
+            "base_url": server.base_url,
+            "model": "hy-mt2:7b",
+        }),
+    );
+
+    let output = run_cli(&sandbox, &["models", "--provider", "ollama"]);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stdout(&output).contains("hy-mt2:7b"));
+    assert_eq!(server.hits(), 1, "the stored URL must be used");
+}
+
+#[test]
+fn translate_file_uses_the_enabled_fallback_provider() {
+    let server = FakeServer::start(vec![chat_route("Übersetzt.")]);
+    let sandbox = Sandbox::new("file-fallback");
+    let source = sandbox.path().join("note.md");
+    std::fs::write(&source, "Hello, world!\n").expect("write the document");
+    write_settings(
+        &sandbox,
+        serde_json::json!({
+            "provider": "ollama",
+            "base_url": "http://127.0.0.1:1",
+            "model": "hy-mt2:7b",
+            "fallback_enabled": true,
+            "fallback_provider": "ollama",
+            "fallback_base_url": server.base_url,
+            "fallback_model": "hy-mt2:7b",
+        }),
+    );
+
+    let output = run_cli(
+        &sandbox,
+        &[
+            "translate-file",
+            source.to_str().expect("path"),
+            "--target",
+            "de",
+        ],
+    );
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let written = PathBuf::from(stdout(&output).trim());
+    let text = std::fs::read_to_string(&written).expect("read the output");
+    assert!(text.contains("Übersetzt"), "translation written: {text}");
+    assert!(server.hits() >= 1, "the fallback server must be used");
 }
 
 #[test]

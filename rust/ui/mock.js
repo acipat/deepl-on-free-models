@@ -575,6 +575,15 @@
     };
   }
 
+  /** `?login=requiresApproval` lets the standalone UI show the approval hint. */
+  function loginItemScenario() {
+    const params = new URLSearchParams(location.search);
+    const value = params.get("login") || "disabled";
+    return ["enabled", "disabled", "requiresApproval", "unsupported"].includes(value)
+      ? value
+      : "disabled";
+  }
+
   function baseState() {
     return {
       tab: "translate",
@@ -605,6 +614,8 @@
       speaking: "",
       hotkeyMessage: "",
       selectionHotkeyMessage: "",
+      loginItemStatus: loginItemScenario(),
+      loginItemError: null,
       fileJob: null,
       write: {
         inProgress: false,
@@ -638,6 +649,7 @@
       total: 11,
       percent: 100,
       output: "~/Documents/quarterly-report_uk.pdf",
+      savedPath: null,
       resultName: "quarterly-report_uk.pdf",
       message: null,
       warnings: 2,
@@ -654,6 +666,15 @@
       state.lastDurationMs = null;
     } else if (hash === "progress" || hash === "translate-progress") {
       state.translatedText = "";
+      state.isTranslating = true;
+      state.completed = 3;
+      state.total = 7;
+      state.tokensPerSecond = null;
+      state.lastDurationMs = null;
+    } else if (hash === "streaming") {
+      // A translation that is still running but already shows its partial text.
+      const output = demoTranslation(state.sourceText);
+      state.translatedText = output.slice(0, Math.ceil(output.length / 2));
       state.isTranslating = true;
       state.completed = 3;
       state.total = 7;
@@ -685,6 +706,7 @@
         total: 11,
         percent: 36,
         output: null,
+        savedPath: null,
         resultName: null,
         message: null,
         warnings: 0,
@@ -704,6 +726,7 @@
         total: 0,
         percent: 0,
         output: null,
+        savedPath: null,
         resultName: null,
         message: "No selectable text found. For a scanned PDF, run text recognition first.",
         warnings: 0,
@@ -848,6 +871,12 @@
     translateTimer = setInterval(() => {
       state.completed = Math.min(state.total, state.completed + 1);
       emit({ type: "progress", completed: state.completed, total: state.total });
+      if (state.completed === 3) {
+        // Show the streaming preview the real controller now emits.
+        const output = demoTranslation(state.sourceText);
+        state.translatedText = output.slice(0, Math.ceil(output.length / 2));
+        emit({ type: "translationPartial", value: state.translatedText });
+      }
       if (state.completed >= state.total) {
         stopTranslate();
         finishTranslate();
@@ -919,6 +948,7 @@
       total: 0,
       percent: 0,
       output: null,
+      savedPath: null,
       resultName: null,
       message: null,
       warnings: 0,
@@ -1210,6 +1240,9 @@
       state.settings.model = entry.modelId;
       const providerValue = providerValueFor(entry.provider);
       if (providerValue) {
+        // Mirrors AppSettings::apply_provider: a session key belongs to the
+        // provider it was issued for, never to the newly selected one.
+        if (providerValue !== state.settings.provider) state.settings.apiKey = "";
         state.settings.provider = providerValue;
         if (providerValue === "ollama") state.settings.baseUrl = "http://127.0.0.1:11434";
         else if (providerValue === "ollamaCloud") state.settings.baseUrl = "https://ollama.com/v1";
@@ -1253,10 +1286,28 @@
       if (startup === "write") {
         return { catalog: false, writeText: WRITE_SOURCE, tab: "write" };
       }
+      if (startup === "write-text") {
+        // Mirrors `--write-text`: the text is in the payload, no tab requested.
+        return { catalog: false, writeText: WRITE_SOURCE, tab: null };
+      }
       if (["translate", "files", "write", "history"].includes(startup)) {
         return { catalog: false, writeText: null, tab: startup };
       }
       return { catalog: false, writeText: null, tab: null };
+    },
+    get_login_item() {
+      return { status: state.loginItemStatus, error: state.loginItemError };
+    },
+    set_login_item(args) {
+      const enabled = !!(args && args.enabled);
+      if (state.loginItemStatus === "requiresApproval") return true;
+      state.loginItemStatus = enabled ? "enabled" : "disabled";
+      state.loginItemError = null;
+      emit({ type: "loginItem", value: state.loginItemStatus });
+      return true;
+    },
+    open_login_item_settings() {
+      return true;
     },
     save_settings(args) {
       const incoming = args && args.settings ? args.settings : {};
@@ -1300,7 +1351,8 @@
       if (!state.fileJob) return false;
       const destination = (args && args.path) || "";
       if (!destination) return false;
-      state.fileJob.output = destination;
+      // The staged output stays the source for every later save.
+      state.fileJob.savedPath = destination;
       state.fileJob.resultName = destination.split(/[\\/]/).pop();
       state.fileJob.saveError = null;
       emitFileJob();
