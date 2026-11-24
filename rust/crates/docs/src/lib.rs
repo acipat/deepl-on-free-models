@@ -96,7 +96,7 @@ pub use kind::DocumentKind;
 pub use pdf::fonts::{cjk_font_available, system_font_available};
 pub use pdf::{PdfBlock, PdfLayout, TextAlignment};
 
-use ofm_i18n::Language;
+use ofm_i18n::{AppLanguage, Language, LanguageTable};
 
 /// Format-specific state that a translated document needs when writing back.
 #[derive(Debug)]
@@ -131,6 +131,24 @@ impl OpenedDocument {
             Some(text) => text.clone(),
             None => self.paragraphs.join("\n"),
         }
+    }
+
+    /// Detect the source language from the document's opening text.
+    pub fn detect_language(&self, preferred: AppLanguage) -> Option<&'static Language> {
+        if let Some(text) = &self.source_text {
+            return LanguageTable::detect(text, preferred);
+        }
+        const SAMPLE_CHARS: usize = 2_000;
+        let mut sample = String::new();
+        for paragraph in &self.paragraphs {
+            let remaining = SAMPLE_CHARS.saturating_sub(sample.chars().count());
+            if remaining == 0 {
+                break;
+            }
+            sample.extend(paragraph.chars().take(remaining));
+            sample.push('\n');
+        }
+        LanguageTable::detect(&sample, preferred)
     }
 }
 

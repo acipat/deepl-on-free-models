@@ -121,8 +121,9 @@ impl LanguageTable {
     /// Guess the language of `text`, mirroring `Language.detect` in Swift.
     ///
     /// Only the first 600 characters are examined. Script ranges
-    /// decide Japanese, Korean, Thai, Hebrew, Arabic, Hindi, Bengali, Tamil,
-    /// Telugu, Gujarati and Chinese; Cyrillic text is scored between Ukrainian
+    /// decide Japanese, Korean, Thai, Hebrew, Hindi, Bengali, Tamil, Telugu,
+    /// Gujarati and Chinese. Arabic-script text needs language-specific clues;
+    /// Cyrillic text is scored between Ukrainian
     /// and Russian (`preferred` breaks ties); Latin text goes through the
     /// stop-word scorer and falls back to English. Armenian and Georgian text
     /// returns `None`, exactly like the Swift original.
@@ -150,8 +151,7 @@ impl LanguageTable {
             return LanguageTable::get("he");
         }
         if contains_any(sample, &[(0x0600, 0x06FF), (0x0750, 0x077F)]) {
-            // Arabic and Arabic Supplement.
-            return LanguageTable::get("ar");
+            return detect_arabic_script(sample);
         }
         if contains_any(sample, &[(0x0900, 0x097F)]) {
             // Devanagari.
@@ -223,6 +223,31 @@ fn contains_any(sample: &str, ranges: &[(u32, u32)]) -> bool {
             .iter()
             .any(|&(low, high)| low <= value && value <= high)
     })
+}
+
+/// Arabic script is shared across languages. Leave ambiguous text in Auto.
+fn detect_arabic_script(sample: &str) -> Option<&'static Language> {
+    if sample.contains(|character| "ٹڈڑںھہے".contains(character)) {
+        return LanguageTable::get("ur");
+    }
+    let tokens = words(sample);
+    let persian = tokens.iter().any(|word| {
+        matches!(
+            word.as_str(),
+            "است" | "هست" | "بود" | "برای" | "این" | "بفرستید"
+        )
+    });
+    let arabic = tokens.iter().any(|word| {
+        matches!(
+            word.as_str(),
+            "هذا" | "هذه" | "ذلك" | "الذي" | "التي" | "إلى"
+        )
+    });
+    match (persian, arabic) {
+        (true, false) => LanguageTable::get("fa"),
+        (false, true) => LanguageTable::get("ar"),
+        _ => None,
+    }
 }
 
 /// Stop-word sets of the detector, built once on first use.

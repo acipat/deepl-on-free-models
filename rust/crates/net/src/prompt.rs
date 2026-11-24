@@ -44,15 +44,8 @@ impl PromptPlan<'_> {
         let body = self.text.trim();
         let target = self.target.english_name;
 
-        // TranslateGemma's card needs both language names and codes. A detected
-        // source fills those required fields (the format cannot omit them), but
-        // only an explicit choice also gets the source-language prefix below.
-        if self.family == PromptFamily::TranslateGemma && !self.source.is_auto() {
-            return vec![PromptBuilder::translate_gemma_prompt(
-                body,
-                self.source,
-                self.target,
-            )];
+        if let Some(prompt) = self.gemma_prompt(body) {
+            return vec![prompt];
         }
 
         if self.is_heading {
@@ -87,10 +80,7 @@ impl PromptPlan<'_> {
         })
     }
 
-    /// The exact first request body, including the source-language prefix.
-    ///
-    /// Only an explicitly chosen source language is stated; a detected one is
-    /// left out because the detector cannot promise it is correct.
+    /// The exact first request body, including any source-language prefix.
     pub fn first_prompt(&self) -> String {
         let mut ladder = self.ladder();
         let first = if ladder.is_empty() {
@@ -98,12 +88,21 @@ impl PromptPlan<'_> {
         } else {
             ladder.remove(0)
         };
-        let source = if self.source_explicit {
-            Some(self.source)
-        } else {
-            None
-        };
-        with_source_language(first, source)
+        with_source_language(first, self.source_hint())
+    }
+
+    pub(crate) fn gemma_prompt(&self, text: &str) -> Option<String> {
+        // Keep the model card's format verbatim. Auto's Devanagari result
+        // cannot distinguish Hindi from Marathi or other languages.
+        (self.family == PromptFamily::TranslateGemma
+            && !self.source.is_auto()
+            && (self.source_explicit || self.source.code != "hi"))
+            .then(|| PromptBuilder::translate_gemma_prompt(text, self.source, self.target))
+    }
+
+    pub(crate) fn source_hint(&self) -> Option<&Language> {
+        // TranslateGemma already names its source in the instruction.
+        (self.source_explicit && self.family != PromptFamily::TranslateGemma).then_some(self.source)
     }
 }
 

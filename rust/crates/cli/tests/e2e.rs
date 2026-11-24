@@ -393,7 +393,7 @@ fn prompt_preview_uses_the_translate_gemma_instruction() {
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     let text = stdout(&output);
     assert!(
-        text.contains("You are a professional English (en) to German (de) translator."),
+        text.starts_with("You are a professional English (en) to German (de) translator."),
         "prompt: {text}"
     );
     assert!(

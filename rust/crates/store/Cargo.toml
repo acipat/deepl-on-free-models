@@ -28,6 +28,7 @@ thiserror.workspace = true
 # owner-only file keeps the tests hermetic.
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3.6.3", features = ["windows-native"] }
+windows = { version = "0.62.2", features = ["Win32_Security_Credentials"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3.6.3", features = ["apple-native"] }

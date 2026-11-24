@@ -440,7 +440,7 @@ impl Translator {
         is_heading: bool,
     ) -> Result<BlockResult, TranslationError> {
         let body = text.trim();
-        let prompts = PromptPlan {
+        let plan = PromptPlan {
             text: body,
             target: request.target,
             source: request.source,
@@ -450,16 +450,13 @@ impl Translator {
             family: PromptFamily::for_model(&config.model),
             is_heading,
             preserve_markdown,
-        }
-        .ladder();
+        };
 
         self.buffered_translation(
-            &prompts,
-            body,
+            plan,
             request,
             config,
             BlockOptions {
-                source_language: request.source_explicit.then_some(request.source),
                 preserve_line_breaks: false,
                 requires_markdown_structure: false,
             },
@@ -470,23 +467,23 @@ impl Translator {
     /// Try every prompt (with lowered-temperature retries) until one validates.
     async fn buffered_translation(
         &self,
-        prompts: &[String],
-        source: &str,
+        plan: PromptPlan<'_>,
         request: &TranslateRequest<'_>,
         config: &BackendConfig,
-        options: BlockOptions<'_>,
+        options: BlockOptions,
     ) -> Result<BlockResult, TranslationError> {
+        let source = plan.text;
         let source_count = source.chars().count();
         let max_bytes = source_count.saturating_mul(4).saturating_add(100).max(200) * 4;
 
-        for (index, prompt) in prompts.iter().enumerate() {
+        for (index, prompt) in plan.ladder().into_iter().enumerate() {
+            let prompt = with_source_language(prompt, plan.source_hint());
             let attempts = if index == 0 { 3 } else { 2 };
             for attempt in 0..attempts {
                 if attempt > 0 {
                     sleep_or_cancel(RETRY_DELAY, request.cancel.as_ref()).await?;
                 }
                 let retry_config = retry_config(config, attempt);
-                let prompt = with_source_language(prompt.clone(), options.source_language);
                 let raw = self
                     .collect_candidate(&prompt, &retry_config, max_bytes, request.cancel.as_ref())
                     .await?;
@@ -517,10 +514,7 @@ impl Translator {
         if !(options.requires_markdown_structure
             || options.preserve_line_breaks && source.contains('\n'))
         {
-            if let Some(segmented) = self
-                .sentence_fallback(source, request, config, options.source_language)
-                .await?
-            {
+            if let Some(segmented) = self.sentence_fallback(plan, request, config).await? {
                 return Ok(segmented);
             }
         }
@@ -530,11 +524,11 @@ impl Translator {
     /// Translate sentence by sentence when the whole block keeps failing.
     async fn sentence_fallback(
         &self,
-        source: &str,
+        plan: PromptPlan<'_>,
         request: &TranslateRequest<'_>,
         config: &BackendConfig,
-        source_language: Option<&Language>,
     ) -> Result<Option<BlockResult>, TranslationError> {
+        let source = plan.text;
         if source.contains("http") || source.contains("](") || source.contains('`') {
             return Ok(None);
         }
@@ -547,16 +541,10 @@ impl Translator {
         let mut failures = 0usize;
         let mut tokens = 0u64;
         let mut seconds = 0.0f64;
-        let family = PromptFamily::for_model(&config.model);
-        let gemma = family == PromptFamily::TranslateGemma && !request.source.is_auto();
         for piece in &pieces {
             check_cancelled(request.cancel.as_ref())?;
-            let prompts = if gemma {
-                vec![PromptBuilder::translate_gemma_prompt(
-                    piece,
-                    request.source,
-                    request.target,
-                )]
+            let prompts = if let Some(prompt) = plan.gemma_prompt(piece) {
+                vec![prompt]
             } else {
                 unique_prompts(vec![
                     PromptBuilder::plain_prompt(piece, request.target.english_name),
@@ -586,7 +574,7 @@ impl Translator {
                     .saturating_add(100)
                     .max(200)
                     * 4;
-                let prompt = with_source_language(prompt.clone(), source_language);
+                let prompt = with_source_language(prompt.clone(), plan.source_hint());
                 let raw = self
                     .collect_candidate(&prompt, &retry, max_bytes, request.cancel.as_ref())
                     .await?;
@@ -677,8 +665,7 @@ impl Translator {
 
 /// Options shared by the buffered (block) translation ladder.
 #[derive(Clone, Copy)]
-struct BlockOptions<'a> {
-    source_language: Option<&'a Language>,
+struct BlockOptions {
     preserve_line_breaks: bool,
     requires_markdown_structure: bool,
 }

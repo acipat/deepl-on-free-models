@@ -336,7 +336,9 @@ async fn translate_file(args: FileArgs) -> Result<(), String> {
         .unwrap_or_else(|| DocumentTranslator::suggested_path(&args.path, target));
 
     let translator = Translator::new();
-    let source = LanguageTable::AUTO;
+    let source = document
+        .detect_language(settings.interface_language)
+        .unwrap_or(&LanguageTable::AUTO);
     let fallback = resolved_fallback(&settings);
     let mut failures: usize = 0;
 
@@ -346,7 +348,7 @@ async fn translate_file(args: FileArgs) -> Result<(), String> {
         &mut |paragraph: &str| {
             let request = ofm_net::TranslateRequest {
                 text: paragraph,
-                source: &source,
+                source,
                 source_explicit: false,
                 target,
                 style: TranslationStyle::Auto,

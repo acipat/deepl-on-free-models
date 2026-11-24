@@ -19,12 +19,12 @@ use tauri::{Emitter, Manager};
 /// Shared controller handed to every command.
 pub struct Shared {
     pub controller: Arc<AppController>,
-    /// Actions requested on the command line, read once by the frontend.
+    /// Command-line actions awaiting consumption by the frontend.
     pub startup: Mutex<Startup>,
 }
 
 /// Command-line actions the window applies after it has loaded.
-#[derive(Debug, Default, Clone, serde::Serialize)]
+#[derive(Debug, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Startup {
     /// Open the model catalogue.
@@ -36,8 +36,7 @@ pub struct Startup {
 }
 
 /// Parse the flags the Python build accepted so existing shortcuts keep working.
-fn parse_arguments() -> Startup {
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
+fn parse_arguments(arguments: &[String]) -> Option<Startup> {
     let mut startup = Startup::default();
     let mut index = 0;
     while index < arguments.len() {
@@ -76,13 +75,13 @@ fn parse_arguments() -> Startup {
                      --catalog                 open the model catalogue\n\
                      --debug                   verbose log"
                 );
-                std::process::exit(0);
+                return None;
             }
             other => eprintln!("unknown argument: {other}"),
         }
         index += 1;
     }
-    startup
+    Some(startup)
 }
 
 /// Controller mutations requested on the command line.
@@ -127,6 +126,9 @@ fn apply_startup_actions(controller: &Arc<AppController>, arguments: &[String]) 
 
 fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let Some(startup) = parse_arguments(&arguments) else {
+        return;
+    };
     let debug = arguments.iter().any(|argument| argument == "--debug");
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(if debug {
         "debug"
@@ -136,23 +138,38 @@ fn main() {
     .init();
 
     let controller = Arc::new(AppController::new());
-    let startup = parse_arguments();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            let arguments = argv.get(1..).unwrap_or_default();
+            let Some(startup) = parse_arguments(arguments) else {
+                return;
+            };
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();
             }
-            // A second launch may carry a file to translate.
-            let controller = app.state::<Shared>().controller.clone();
-            apply_startup_actions(&controller, &argv);
+            let shared = app.state::<Shared>();
+            apply_startup_actions(&shared.controller, arguments);
+            if startup.catalog || startup.write_text.is_some() || startup.tab.is_some() {
+                {
+                    let mut pending = shared.startup.lock().unwrap_or_else(|p| p.into_inner());
+                    pending.catalog |= startup.catalog;
+                    if startup.tab.is_some() || startup.write_text.is_some() {
+                        pending.tab = startup.tab;
+                    }
+                    if startup.write_text.is_some() {
+                        pending.write_text = startup.write_text;
+                    }
+                }
+                let _ = app.emit("app://event", serde_json::json!({ "type": "startup" }));
+            }
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(Shared {
             controller: Arc::clone(&controller),
-            startup: Mutex::new(startup.clone()),
+            startup: Mutex::new(startup),
         })
         .setup(move |app| {
             install_tray(&app.handle().clone())?;
