@@ -200,6 +200,7 @@ mod windows {
     use std::time::Duration;
 
     use windows::core::{w, Interface, GUID, PCWSTR, PWSTR};
+    use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
     use windows::Win32::Media::Speech::{
         ISpObjectToken, ISpObjectTokenCategory, ISpVoice, SPF_ASYNC, SPF_IS_XML,
         SPF_PURGEBEFORESPEAK,
@@ -283,15 +284,18 @@ mod windows {
                 return Vec::new();
             }
             // SAFETY: initialises COM for the calling thread; balanced below.
-            let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.0 == 0;
-            // SAFETY: COM is initialised above for this thread; the token
-            // objects are released before `CoUninitialize` below.
+            let result = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+            if result.is_err() && result != RPC_E_CHANGED_MODE {
+                return Vec::new();
+            }
+            // SAFETY: COM is available in our apartment or the caller's
+            // existing apartment. The token objects are released by `collect`.
             let mut voices: Vec<(String, String)> = unsafe { voice_tokens() }
                 .into_iter()
                 .map(|(id, label, _)| (id, label))
                 .collect();
-            if initialized {
-                // SAFETY: balances the successful initialisation above.
+            if result.is_ok() {
+                // SAFETY: balances S_OK and S_FALSE without affecting the caller's COM count.
                 unsafe { CoUninitialize() };
             }
             voices.sort_by_key(|(_, label)| label.to_lowercase());
@@ -363,16 +367,18 @@ mod windows {
 
     fn worker(init: SyncSender<bool>, receiver: Receiver<Command>, speaking: Arc<AtomicBool>) {
         // SAFETY: COM initialisation for this dedicated worker thread.
-        let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.0 == 0;
+        let result = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        if result.is_err() {
+            let _ = init.send(false);
+            return;
+        }
         // SAFETY: creates the SAPI voice object on the thread that will use it.
         let voice: Option<ISpVoice> =
             unsafe { CoCreateInstance(&CLSID_SP_VOICE, None, CLSCTX_ALL) }.ok();
         let _ = init.send(voice.is_some());
         let Some(voice) = voice else {
-            if initialized {
-                // SAFETY: balances the initialisation above.
-                unsafe { CoUninitialize() };
-            }
+            // SAFETY: balances the successful initialisation above.
+            unsafe { CoUninitialize() };
             return;
         };
 
@@ -426,10 +432,9 @@ mod windows {
             }
         }
 
-        if initialized {
-            // SAFETY: balances the initialisation at the top of the worker.
-            unsafe { CoUninitialize() };
-        }
+        drop(voice);
+        // SAFETY: balances the successful initialisation after releasing the voice.
+        unsafe { CoUninitialize() };
     }
 
     fn apply_voice(voice: &ISpVoice, voice_id: &str, language_code: &str) {

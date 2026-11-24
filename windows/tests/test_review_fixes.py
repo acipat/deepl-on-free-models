@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import subprocess
 import sys
 import threading
 import time
@@ -485,7 +486,9 @@ def test_second_launch_applies_every_action(qapp, tmp_path):
 
 
 def test_second_launch_applies_its_actions(qapp, tmp_path, monkeypatch):
-    monkeypatch.setattr(app_module, "SINGLE_INSTANCE_KEY", f"deepl-ofm-test-{uuid.uuid4()}")
+    key = f"deepl-ofm-test-{uuid.uuid4()}"
+    monkeypatch.setattr(app_module, "SINGLE_INSTANCE_KEY", key)
+    monkeypatch.setenv("APPDATA", str(tmp_path))
     window = _FakeWindow()
     write_view = _FakeWriteView()
     window.pages["write"] = write_view
@@ -497,14 +500,28 @@ def test_second_launch_applies_its_actions(qapp, tmp_path, monkeypatch):
 
     def record(window_, controller_, raw):
         received.append(raw)
-        original(window_, controller_, raw)
+        return original(window_, controller_, raw)
 
     monkeypatch.setattr(app_module, "_handle_instance_message", record)
     server = app_module._install_instance_server(window, controller)
     try:
+        assert server.isListening(), server.errorString()
         target = tmp_path / "report.pdf"
-        args = app_module._parse_args(
+        launcher = (
+            "import runpy, sys\n"
+            "from deepl_ofm import app\n"
+            "app.SINGLE_INSTANCE_KEY = sys.argv.pop(1)\n"
+            "def reject_duplicate():\n"
+            "    raise RuntimeError('second launch tried to start another instance')\n"
+            "app.AppController = reject_duplicate\n"
+            "runpy.run_module('deepl_ofm', run_name='__main__')\n"
+        )
+        with subprocess.Popen(
             [
+                sys.executable,
+                "-c",
+                launcher,
+                key,
                 "--prefill",
                 "Bonjour",
                 "--open-file",
@@ -515,37 +532,20 @@ def test_second_launch_applies_its_actions(qapp, tmp_path, monkeypatch):
                 "--connect",
                 "--catalog",
                 "--load-fallback-models",
-            ]
-        )
-        # The server lives in this process, so a blocking `waitForReadyRead` in
-        # the same thread would starve it: on Windows a named pipe discards data
-        # the reader has not consumed before the writer closes.  In production
-        # the two sides are separate processes; here the sender needs its own
-        # thread while the main thread pumps the server's event loop.
-        outcome: dict[str, bool] = {}
-        sender = threading.Thread(
-            target=lambda: outcome.update(
-                sent=app_module._notify_running_instance(
-                    app_module._action_payload(args)
-                )
-            ),
-            daemon=True,
-        )
-        sender.start()
-        assert wait_until(lambda: not sender.is_alive(), timeout=10.0), "sender"
-        sender.join()
-        assert outcome.get("sent") is True
+            ],
+            cwd=Path(app_module.__file__).resolve().parents[1],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        ) as sender:
+            try:
+                assert wait_until(lambda: sender.poll() is not None, timeout=10.0), "sender"
+                output, _ = sender.communicate()
+                assert sender.returncode == 0, output.decode("utf-8", errors="replace")
+            finally:
+                if sender.poll() is None:
+                    sender.kill()
         # The connection itself must always be accepted.
         assert wait_until(lambda: window.presented >= 1, timeout=10.0), "accept"
-        if sys.platform == "win32":
-            pytest.skip(
-                "Qt's Windows named-pipe reader does not hand the payload to a "
-                "QLocalServer living in the same process: the server accepts "
-                "the connection (presented == 1) and never receives a "
-                "readyRead. The two-process path cannot be exercised in a unit "
-                "test here, and the actions themselves are covered by "
-                "test_second_launch_applies_every_action."
-            )
         # Wait for each effect separately so a failure names the effect that did
         # not arrive instead of reporting an opaque `assert []`.  The window is
         # slow on CI runners, hence the generous timeout.
@@ -555,7 +555,6 @@ def test_second_launch_applies_its_actions(qapp, tmp_path, monkeypatch):
             + " listening=" + repr(server.isListening())
             + " pending=" + repr(server.hasPendingConnections())
             + " presented=" + repr(window.presented)
-            + " payload=" + repr(app_module._action_payload(args))
         )
         assert wait_until(lambda: bool(controller.files), timeout=10.0), "open file"
         assert wait_until(lambda: bool(controller.clipboard), timeout=10.0), "clipboard"

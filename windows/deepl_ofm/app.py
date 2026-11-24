@@ -12,7 +12,7 @@ import os
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QDeadlineTimer, Qt
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication
 
@@ -126,6 +126,7 @@ def _configure_logging(debug: bool) -> None:
 
 
 SINGLE_INSTANCE_KEY = "DeepL-oFM-instance"
+_INSTANCE_ACK = b"ack\n"
 
 #: Command-line actions a second launch forwards to the running instance.
 _ACTION_FIELDS = (
@@ -166,23 +167,31 @@ def _actions_from_payload(payload: dict[str, object]) -> argparse.Namespace:
     return argparse.Namespace(**values)
 
 
-def _notify_running_instance(payload: dict[str, object]) -> bool:
-    """Return True when another copy is running; hand it this launch's actions."""
+def _notify_running_instance(payload: dict[str, object]) -> bool | None:
+    """Return delivery status, or None if no instance accepted the connection."""
     socket = QLocalSocket()
     socket.connectToServer(SINGLE_INSTANCE_KEY)
     if not socket.waitForConnected(250):
-        return False
-    message = json.dumps({"show": True, **payload}, ensure_ascii=False)
-    socket.write(message.encode("utf-8") + b"\n")
-    socket.flush()
-    if socket.waitForBytesWritten(1000):
-        # Wait for the acknowledgement so the actions are applied before this
-        # process exits.  Closing a named-pipe handle discards bytes that the
-        # other side has not read yet, which silently dropped the second
-        # launch's arguments on Windows.
-        socket.waitForReadyRead(2000)
-    socket.disconnectFromServer()
-    return True
+        return None
+    try:
+        message = json.dumps({"show": True, **payload}, ensure_ascii=False)
+        frame = message.encode("utf-8") + b"\n"
+        if socket.write(frame) != len(frame):
+            return False
+        socket.flush()
+        if socket.bytesToWrite():
+            socket.waitForBytesWritten(1000)
+
+        # Even when the local write buffer is empty, the peer may not have
+        # read the named pipe yet. Only its acknowledgement confirms delivery.
+        deadline = QDeadlineTimer(2000)
+        while not socket.canReadLine():
+            remaining = deadline.remainingTime()
+            if remaining <= 0 or not socket.waitForReadyRead(remaining):
+                break
+        return bytes(socket.readLine()) == _INSTANCE_ACK
+    finally:
+        socket.disconnectFromServer()
 
 
 def _apply_startup_state(window, args) -> None:
@@ -199,20 +208,22 @@ def _apply_actions(window, controller: AppController, args) -> None:
     _schedule_startup_actions(window, controller, args)
 
 
-def _handle_instance_message(window, controller: AppController, raw: bytes) -> None:
-    """Apply one newline-framed JSON message from a second launch."""
+def _handle_instance_message(window, controller: AppController, raw: bytes) -> bool:
+    """Apply one newline-framed JSON message and report whether it was accepted."""
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         log.warning("ignoring a malformed second-instance message")
-        return
+        return False
     if not isinstance(payload, dict):
         log.warning("ignoring a non-object second-instance message")
-        return
+        return False
     try:
         _apply_actions(window, controller, _actions_from_payload(payload))
     except Exception:  # noqa: BLE001 - a bad payload must not kill the server
         log.exception("could not apply second-instance actions")
+        return False
+    return True
 
 
 def _install_instance_server(window, controller: AppController) -> QLocalServer:
@@ -233,13 +244,8 @@ def _install_instance_server(window, controller: AppController) -> QLocalServer:
             data = buffers.get(key, b"") + bytes(connection.readAll())
             while b"\n" in data:
                 line, data = data.split(b"\n", 1)
-                if line.strip():
-                    _handle_instance_message(window, controller, line)
-                    # Acknowledge only after the actions were applied: on
-                    # Windows the client's pipe handle is closed by
-                    # `disconnectFromServer`, and unread bytes are discarded
-                    # with it, so the second launch must wait for this.
-                    connection.write(b"ack\n")
+                if line.strip() and _handle_instance_message(window, controller, line):
+                    connection.write(_INSTANCE_ACK)
                     connection.flush()
             buffers[key] = data
 
@@ -250,6 +256,8 @@ def _install_instance_server(window, controller: AppController) -> QLocalServer:
         connection.readyRead.connect(read_message)
         connection.disconnected.connect(closed)
         window.present()
+        if connection.bytesAvailable():
+            read_message()
 
     server.newConnection.connect(on_connection)
     return server
@@ -392,9 +400,13 @@ def main(argv: list[str] | None = None) -> int:
     app.setApplicationVersion(__version__)
     app.setDesktopFileName(APP_ID)
 
-    if _notify_running_instance(_action_payload(args)):
-        log.info("another DeepL-oFM instance is running; sent it this launch's actions")
-        return 0
+    delivered = _notify_running_instance(_action_payload(args))
+    if delivered is not None:
+        if delivered:
+            log.info("another DeepL-oFM instance is running; sent it this launch's actions")
+            return 0
+        log.error("the running DeepL-oFM instance did not acknowledge this launch's actions")
+        return 1
 
     Theme.apply(app)
     icon = icons.icon("translate", size=128)
