@@ -23,6 +23,9 @@ use crate::dpapi;
 use crate::error::StoreError;
 use crate::paths;
 
+#[cfg(windows)]
+mod windows_compat;
+
 /// Service name used for the platform credential entries, shared with Python.
 const SERVICE: &str = "ua.admin.hymt";
 
@@ -119,6 +122,9 @@ impl SecretStore {
 
         let _guard = crate::lock(&self.lock);
         let outcome = match self.backend {
+            #[cfg(windows)]
+            Backend::Keyring => windows_compat::read(self, account),
+            #[cfg(not(windows))]
             Backend::Keyring => keyring_read(account),
             Backend::Dpapi | Backend::Plain => {
                 Ok(self.read_values().remove(account).unwrap_or_default())
@@ -147,6 +153,9 @@ impl SecretStore {
 
         let _guard = crate::lock(&self.lock);
         let outcome = match self.backend {
+            #[cfg(windows)]
+            Backend::Keyring => windows_compat::write(self, account, secret),
+            #[cfg(not(windows))]
             Backend::Keyring => keyring_write(account, secret),
             Backend::Dpapi | Backend::Plain => self.write_values_entry(account, secret),
         };
@@ -164,6 +173,9 @@ impl SecretStore {
 
         let _guard = crate::lock(&self.lock);
         let outcome = match self.backend {
+            #[cfg(windows)]
+            Backend::Keyring => windows_compat::delete(self, account),
+            #[cfg(not(windows))]
             Backend::Keyring => keyring_delete(account),
             Backend::Dpapi | Backend::Plain => {
                 let mut values = self.read_values();
@@ -324,6 +336,7 @@ fn keyring_is_usable() -> bool {
 }
 
 /// Read an account from the platform credential store.
+#[cfg(not(windows))]
 fn keyring_read(account: &str) -> Result<String, StoreError> {
     let entry = keyring::Entry::new(SERVICE, account).map_err(keyring_error)?;
     match entry.get_password() {
@@ -334,12 +347,14 @@ fn keyring_read(account: &str) -> Result<String, StoreError> {
 }
 
 /// Write an account to the platform credential store.
+#[cfg(not(windows))]
 fn keyring_write(account: &str, secret: &str) -> Result<(), StoreError> {
     let entry = keyring::Entry::new(SERVICE, account).map_err(keyring_error)?;
     entry.set_password(secret).map_err(keyring_error)
 }
 
 /// Delete an account from the platform credential store, tolerating a miss.
+#[cfg(not(windows))]
 fn keyring_delete(account: &str) -> Result<(), StoreError> {
     let entry = keyring::Entry::new(SERVICE, account).map_err(keyring_error)?;
     match entry.delete_credential() {

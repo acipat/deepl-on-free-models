@@ -29,12 +29,11 @@ pub fn get_state(state: State<'_, Shared>) -> Result<Value, String> {
 /// Command-line actions the window has not consumed yet.
 #[tauri::command]
 pub fn get_startup(state: State<'_, Shared>) -> Result<Value, String> {
-    let startup = state
+    let mut startup = state
         .startup
         .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .clone();
-    Ok(serde_json::to_value(startup).unwrap_or_else(|_| json!({})))
+        .unwrap_or_else(|poison| poison.into_inner());
+    Ok(serde_json::to_value(std::mem::take(&mut *startup)).unwrap_or_else(|_| json!({})))
 }
 
 #[tauri::command]

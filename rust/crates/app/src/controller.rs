@@ -691,13 +691,8 @@ impl AppController {
 
     /// Cancel the running translation.
     pub fn cancel(&self) {
-        if let Some(flag) = self
-            .inner
-            .cancel
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
-        {
+        let mut cancel = self.inner.cancel.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(flag) = cancel.take() {
             flag.store(true, Ordering::SeqCst);
         }
         self.inner.generation.fetch_add(1, Ordering::SeqCst);
@@ -708,9 +703,13 @@ impl AppController {
                 return;
             }
             state.is_translating = false;
+            state.translated_text.clear();
             state.completed = 0;
             state.total = 0;
         }
+        self.emit(AppEvent::TranslatedText {
+            value: String::new(),
+        });
         self.emit(AppEvent::Translating { value: false });
         self.emit(AppEvent::Progress {
             completed: 0,
@@ -1406,7 +1405,9 @@ impl AppController {
                     return;
                 }
             };
-            let source = explicit_source.unwrap_or_else(|| document_source(&document, ui_language));
+            let source = explicit_source
+                .or_else(|| document.detect_language(ui_language).copied())
+                .unwrap_or(LanguageTable::AUTO);
 
             file_update(&inner, generation, |job| {
                 job.state = FileJobState::Translating.value().to_string();
@@ -2202,32 +2203,6 @@ fn create_staging_folder(generation: u64) -> std::io::Result<PathBuf> {
     Ok(folder)
 }
 
-/// The language of a document, detected from its own text.
-///
-/// The Translate pane's detection is deliberately not consulted: a Ukrainian
-/// document must not inherit the English text sitting in the other tab. Only
-/// the opening characters are inspected, so a large PDF is not copied just to
-/// pick a language.
-fn document_source(document: &ofm_docs::OpenedDocument, ui: AppLanguage) -> Language {
-    const SAMPLE_CHARS: usize = 2_000;
-    let mut sample = String::new();
-    if let Some(text) = &document.source_text {
-        sample.extend(text.chars().take(SAMPLE_CHARS));
-    } else {
-        for paragraph in &document.paragraphs {
-            let remaining = SAMPLE_CHARS.saturating_sub(sample.chars().count());
-            if remaining == 0 {
-                break;
-            }
-            sample.extend(paragraph.chars().take(remaining));
-            sample.push('\n');
-        }
-    }
-    LanguageTable::detect(&sample, ui)
-        .copied()
-        .unwrap_or(LanguageTable::AUTO)
-}
-
 fn file_update(inner: &Arc<Inner>, generation: u64, mutate: impl FnOnce(&mut FileJob)) {
     if inner.file_generation.load(Ordering::SeqCst) != generation {
         return;
@@ -2299,6 +2274,8 @@ fn file_cancelled(inner: &Arc<Inner>, generation: u64) {
 
 /// Start a translation for `inner`. Shared by the command and the debounce timer.
 fn translate_now(inner: &Arc<Inner>, force: bool) {
+    // Serialize job replacement with callbacks publishing to the state and UI.
+    let mut current_job = inner.cancel.lock().unwrap_or_else(|p| p.into_inner());
     // Take the two locks in sequence, never nested: another path takes them in
     // the opposite order and `std::sync::RwLock` would deadlock.
     let (text, source_code, target_code, style_value, tone_value) = {
@@ -2319,16 +2296,6 @@ fn translate_now(inner: &Arc<Inner>, force: bool) {
     if text.trim().is_empty() {
         return;
     }
-    if config.model.trim().is_empty() {
-        let message = t("Choose a model in Settings.").to_string();
-        {
-            let mut state = inner.state.write().unwrap_or_else(|p| p.into_inner());
-            state.error_message = Some(message.clone());
-        }
-        send(inner, AppEvent::Error { value: message });
-        return;
-    }
-
     let translating = {
         let state = inner.state.read().unwrap_or_else(|p| p.into_inner());
         state.is_translating
@@ -2336,19 +2303,6 @@ fn translate_now(inner: &Arc<Inner>, force: bool) {
     if translating && !force {
         return;
     }
-
-    // Cancel the previous job before its flag is replaced.
-    if let Some(flag) = inner
-        .cancel
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .take()
-    {
-        flag.store(true, Ordering::SeqCst);
-    }
-    let generation = inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
-    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-    *inner.cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&cancel));
 
     // The cache key must include everything that changes the result.
     let key: CacheKey = (
@@ -2374,10 +2328,21 @@ fn translate_now(inner: &Arc<Inner>, force: bool) {
         return;
     }
 
+    // Cancel the previous job before its flag is replaced.
+    if let Some(flag) = current_job.take() {
+        flag.store(true, Ordering::SeqCst);
+    }
+    let generation = inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let error = config
+        .model
+        .trim()
+        .is_empty()
+        .then(|| t("Choose a model in Settings.").to_string());
     {
         let mut state = inner.state.write().unwrap_or_else(|p| p.into_inner());
-        state.is_translating = true;
-        state.error_message = None;
+        state.is_translating = error.is_none();
+        state.translated_text.clear();
+        state.error_message.clone_from(&error);
         state.warning_count = 0;
         state.completed = 0;
         state.total = 0;
@@ -2385,6 +2350,13 @@ fn translate_now(inner: &Arc<Inner>, force: bool) {
         state.last_duration_ms = None;
         state.using_fallback = false;
     }
+    if let Some(value) = error {
+        send(inner, AppEvent::TranslationFailed { value });
+        return;
+    }
+
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    *current_job = Some(Arc::clone(&cancel));
     send(inner, AppEvent::Translating { value: true });
     send(
         inner,
@@ -2393,6 +2365,7 @@ fn translate_now(inner: &Arc<Inner>, force: bool) {
             total: 0,
         },
     );
+    drop(current_job);
 
     let source_explicit = source_code != "auto";
     let source = if source_explicit {
@@ -2420,14 +2393,18 @@ fn translate_now(inner: &Arc<Inner>, force: bool) {
         let progress_worker = Arc::clone(&worker);
         let progress: ofm_net::ProgressFn = Arc::new(move |completed: usize, total: usize| {
             // A superseded job must not move the counters of the new one.
+            let _current_job = progress_worker
+                .cancel
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if progress_worker.generation.load(Ordering::SeqCst) != generation {
+                return;
+            }
             {
                 let mut state = progress_worker
                     .state
                     .write()
                     .unwrap_or_else(|p| p.into_inner());
-                if progress_worker.generation.load(Ordering::SeqCst) != generation {
-                    return;
-                }
                 state.completed = completed;
                 state.total = total;
             }
@@ -2444,6 +2421,10 @@ fn translate_now(inner: &Arc<Inner>, force: bool) {
                 .unwrap_or_else(Instant::now),
         ));
         let partial: ofm_net::PartialFn = Arc::new(move |chunk: &str| {
+            let _current_job = partial_worker
+                .cancel
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             if partial_worker.generation.load(Ordering::SeqCst) != generation {
                 return;
             }
@@ -2493,6 +2474,7 @@ fn translate_now(inner: &Arc<Inner>, force: bool) {
         let outcome = worker.translator.translate(request).await;
 
         // A newer job superseded this one: drop the result silently.
+        let current_job = worker.cancel.lock().unwrap_or_else(|p| p.into_inner());
         if worker.generation.load(Ordering::SeqCst) != generation {
             return;
         }
@@ -2518,13 +2500,13 @@ fn translate_now(inner: &Arc<Inner>, force: bool) {
                 }
                 *worker.cache.lock().unwrap_or_else(|p| p.into_inner()) = Some(key);
 
-                send(&worker, AppEvent::Translating { value: false });
                 send(
                     &worker,
                     AppEvent::TranslatedText {
                         value: output.text.clone(),
                     },
                 );
+                send(&worker, AppEvent::Translating { value: false });
                 send(&worker, AppEvent::Metrics);
 
                 if output.warnings > 0 {
@@ -2538,6 +2520,7 @@ fn translate_now(inner: &Arc<Inner>, force: bool) {
                     }
                     send(&worker, AppEvent::Error { value: message });
                 }
+                drop(current_job);
 
                 let keep_history = worker
                     .settings
@@ -2578,14 +2561,20 @@ fn translate_now(inner: &Arc<Inner>, force: bool) {
                 {
                     let mut state = worker.state.write().unwrap_or_else(|p| p.into_inner());
                     state.is_translating = false;
+                    state.translated_text.clear();
                     state.completed = 0;
                     state.total = 0;
                     if !cancelled {
                         state.error_message = Some(error.message());
                     }
                 }
-                send(&worker, AppEvent::Translating { value: false });
                 if cancelled {
+                    send(
+                        &worker,
+                        AppEvent::TranslatedText {
+                            value: String::new(),
+                        },
+                    );
                     send(
                         &worker,
                         AppEvent::Progress {
@@ -2618,6 +2607,7 @@ fn translate_now(inner: &Arc<Inner>, force: bool) {
                         set_status(&worker, BackendStatus::Failed, message);
                     }
                 }
+                send(&worker, AppEvent::Translating { value: false });
             }
         }
     });
@@ -3678,6 +3668,29 @@ mod file_tests {
         );
         controller.cancel();
         controller.clear_source();
+    }
+
+    #[test]
+    fn changing_language_discards_the_previous_streamed_text_immediately() {
+        let backend = fake_backend::FakeBackend::start("Guten Morgen.");
+        let fixture = Fixture::new("switch-partial");
+        fixture.use_backend(&backend, "test-model");
+        let controller = &fixture.controller;
+        controller.set_target_language("de");
+        controller.set_source_text("Good morning.\n\nCan you send me the report?");
+        controller.translate(true);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while controller.translated_text().is_empty() {
+            assert!(Instant::now() < deadline, "no German preview arrived");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(controller.state().is_translating);
+        controller.set_target_language("fr");
+        let state = controller.state();
+        assert!(state.is_translating);
+        assert!(state.translated_text.is_empty());
+        controller.cancel();
     }
 
     /// A Ukrainian document must not inherit the English text pane's detection.

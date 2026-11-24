@@ -598,8 +598,8 @@ async fn an_explicit_source_language_is_prefixed() {
 
 #[tokio::test]
 async fn a_detected_source_language_is_not_prefixed() {
-    // The script detector maps Arabic script to Arabic; a Persian sentence then
-    // looks like Arabic. That guess must not be asserted to the model.
+    // Even when detection finds a likely match, a generic prompt leaves the
+    // language unspecified unless the user chose it.
     let detected = LanguageTable::detect("مرحبا بالعالم، هذا اختبار.", AppLanguage::System)
         .expect("Arabic script is detected");
     assert_eq!(detected.code, "ar");
@@ -667,10 +667,7 @@ async fn translate_gemma_uses_the_instruction_published_by_its_model_card() {
     assert_eq!(output.text, "Hallo, Welt!");
     let prompt = server.requests()[0].content().to_string();
     assert!(
-        prompt.starts_with(
-            "The source language is English. You are a professional English (en) to German \
-             (de) translator."
-        ),
+        prompt.starts_with("You are a professional English (en) to German (de) translator."),
         "{prompt}"
     );
     assert!(

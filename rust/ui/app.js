@@ -828,7 +828,6 @@
     fileJobTarget: "",
     firstStateLoaded: false,
     translateBarWidth: 0,
-    startupApplied: false,
     dialogStack: [],
     resultKeys: {},
     voices: [],
@@ -1442,9 +1441,7 @@
       els.stopBtn.disabled = false;
     }
 
-    if (showResult) {
-      paintResult(els.resultView, state.translatedText, state.resultView);
-    }
+    paintResult(els.resultView, state.translatedText, state.resultView);
 
     if (showError) {
       els.errorText.textContent = errorMessage;
@@ -2953,23 +2950,33 @@
     }
   }
 
+  function resetTranslationResult() {
+    // A snapshot already in flight may still contain the previous result.
+    if (local.firstStateLoaded) refreshSequence += 1;
+    state.errorMessage = null;
+    state.completed = 0;
+    state.total = 0;
+    state.translatedText = "";
+    state.warningCount = 0;
+    state.tokensPerSecond = null;
+    state.lastDurationMs = null;
+    state.usingFallback = false;
+  }
+
   function translateNow(force) {
     if (!state.sourceText.trim()) {
       els.sourceInput.focus();
       return;
     }
-    state.errorMessage = null;
+    resetTranslationResult();
     state.isTranslating = true;
-    state.completed = 0;
-    state.total = 0;
-    state.translatedText = "";
     renderTranslate();
     send("translate_text", { force: force !== false });
     pollState(() => state.isTranslating, 180000, 2000);
   }
 
   function copyTranslation() {
-    if (!state.translatedText) return;
+    if (!state.translatedText || state.isTranslating) return;
     send("copy_translation");
     showCopyFeedback("translation");
   }
@@ -3428,6 +3435,9 @@
     const value = eventValue(event, type);
 
     switch (type) {
+      case "startup":
+        if (local.firstStateLoaded) void applyStartup();
+        return;
       case "statechanged":
         if (value && typeof value === "object" && "tab" in value) applyState(value);
         else scheduleRefresh(20);
@@ -3445,11 +3455,16 @@
       case "translating": {
         const flag = typeof value === "boolean" ? value : event.value;
         state.isTranslating = !!flag;
-        if (!flag) scheduleRefresh(80);
-        else renderTranslate();
+        if (flag) {
+          resetTranslationResult();
+          renderTranslate();
+        } else {
+          scheduleRefresh(80);
+        }
         return;
       }
       case "translatedtext":
+        if (local.firstStateLoaded) refreshSequence += 1;
         if (value !== undefined && value !== null) state.translatedText = String(value);
         state.isTranslating = false;
         state.errorMessage = null;
@@ -3480,8 +3495,11 @@
         return;
       case "error":
       case "translationfailed":
+        if (type === "translationfailed") {
+          resetTranslationResult();
+          state.isTranslating = false;
+        }
         state.errorMessage = value !== undefined && value !== null ? String(value) : null;
-        if (type === "translationfailed") state.isTranslating = false;
         renderTranslate();
         return;
       case "backendstatus":
@@ -4275,10 +4293,8 @@
     }
   }
 
-  /** Apply `get_startup()` once, after the first state snapshot. */
+  /** Consume actions sent on the command line by any launch. */
   async function applyStartup() {
-    if (local.startupApplied) return;
-    local.startupApplied = true;
     let startup = null;
     try {
       startup = await invoke("get_startup");
@@ -4286,8 +4302,7 @@
       return;
     }
     if (!startup || typeof startup !== "object") return;
-    if (startup.catalog) openCatalog();
-    if (typeof startup.writeText === "string" && startup.writeText.length > 0) {
+    if (typeof startup.writeText === "string") {
       // A draft given on the command line takes the same path as a pasted one:
       // the stale-result reset, the cancellation of an older rewrite and the
       // "detect the draft's language" default all run.
@@ -4299,6 +4314,7 @@
     if (startup.tab && TABS.includes(String(startup.tab))) {
       selectTab(String(startup.tab));
     }
+    if (startup.catalog) openCatalog();
   }
 
   function applyTheme() {
@@ -4380,7 +4396,7 @@
     observeTranslateBar();
     bindEvents();
     listenNativeDrop();
-    subscribe(handleEvent);
+    await subscribe(handleEvent);
     void loadVoices();
 
     try {
@@ -4390,7 +4406,6 @@
     }
     await refreshCatalogue();
     void ensureCatalogEntries();
-    local.firstStateLoaded = true;
     // WriteState has no `text` field (the draft lives only in the webview), so
     // the standalone demo seeds the editor from the mock instead of AppState.
     if (!local.writeText && !NATIVE && MOCK && typeof MOCK.writeDraft === "string") {
@@ -4400,6 +4415,7 @@
     render();
     applyHashRoute();
     render();
+    local.firstStateLoaded = true;
     // Command-line actions come from Rust after the first snapshot. The other
     // flags are already applied before the webview loads. Startup wins over the
     // standalone hash scenario.

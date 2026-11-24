@@ -31,9 +31,9 @@ pub struct TranslateRequest<'a> {
     pub source: &'a Language,
     /// Whether the user explicitly chose [`Self::source`].
     ///
-    /// A detected language is only a guess (Arabic script does not imply
-    /// Arabic), so the model is told the source language only when this flag is
-    /// true. `false` also covers `LanguageTable::AUTO`.
+    /// Generic instructions only state a source language when this flag is
+    /// true. TranslateGemma may also use a detected language for its required
+    /// source field. `false` covers `LanguageTable::AUTO`.
     pub source_explicit: bool,
     /// Target language.
     pub target: &'a Language,
