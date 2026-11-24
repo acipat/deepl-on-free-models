@@ -5,9 +5,10 @@
 //! The pipeline for one job is:
 //!
 //! 1. [`TextChunker::split`] turns the document into one chunk per line.
-//! 2. Each chunk is translated with the prompt ladder from
-//!    [`PromptBuilder`] (short blocks and headings get the heading instruction,
-//!    longer blocks the styled instruction plus its fallbacks).
+//! 2. Each chunk is translated with the prompt ladder from [`PromptPlan`]:
+//!    structurally recognised headings get the heading instruction, other
+//!    blocks the styled instruction plus its fallbacks, and TranslateGemma the
+//!    instruction published by its model card.
 //! 3. Every candidate is validated with [`OutputSanitizer`], the protected
 //!    tokens are restored and the source line's trailing punctuation is kept.
 //! 4. A block that never validates is left in the source language and counted
@@ -22,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use reqwest::Client;
 
-use ofm_config::{BackendConfig, BackendKind};
+use ofm_config::{BackendConfig, BackendKind, PromptFamily};
 use ofm_i18n::Language;
 use ofm_text::{
     OutputSanitizer, PromptBuilder, TextChunk, TextChunker, TokenRestorer, TranslationStyle,
@@ -36,6 +37,7 @@ use crate::pipeline::{
     with_source_language,
 };
 use crate::probe::probe_models;
+use crate::prompt::{unique_prompts, PromptPlan};
 use crate::request::{CancelFlag, TranslateRequest, TranslationOutput};
 use crate::wire::{
     chat_endpoint, consume_ollama, consume_openai, json_headers, ollama_body, ollama_warm_up_body,
@@ -52,8 +54,6 @@ const CANCEL_POLL: Duration = Duration::from_millis(40);
 const RETRY_DELAY: Duration = Duration::from_millis(120);
 /// Largest streamed line accepted before the response is declared broken.
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
-/// Blocks up to this many characters use the heading instruction.
-const SHORT_BLOCK_LIMIT: usize = 80;
 /// Byte cap for one `rewrite` response.
 const REWRITE_MAX_BYTES: usize = 128_000 * 4;
 /// The prompt used to load a model into memory.
@@ -357,7 +357,13 @@ impl Translator {
             };
 
             let block = match self
-                .translate_chunk(&translatable, request, config, contains_markdown(&line))
+                .translate_chunk(
+                    &translatable,
+                    request,
+                    config,
+                    contains_markdown(&line),
+                    chunk.is_heading,
+                )
                 .await
             {
                 Ok(block) => block,
@@ -431,42 +437,21 @@ impl Translator {
         request: &TranslateRequest<'_>,
         config: &BackendConfig,
         preserve_markdown: bool,
+        is_heading: bool,
     ) -> Result<BlockResult, TranslationError> {
         let body = text.trim();
-        let target = request.target.english_name;
-        let neutral_heading = PromptBuilder::heading_prompt(
-            body,
-            TranslationStyle::Auto,
-            TranslationTone::Standard,
-            target,
-            false,
-        );
-        let plain_fallback = PromptBuilder::plain_prompt(body, target);
-        let prompts = if body.chars().count() <= SHORT_BLOCK_LIMIT {
-            unique_prompts(vec![neutral_heading, plain_fallback])
-        } else {
-            let styled =
-                PromptBuilder::prompt(body, request.style, request.tone, target, preserve_markdown);
-            let natural = PromptBuilder::prompt(
-                body,
-                TranslationStyle::Natural,
-                request.tone,
-                target,
-                preserve_markdown,
-            );
-            let literal = PromptBuilder::prompt(
-                body,
-                TranslationStyle::Literal,
-                TranslationTone::Standard,
-                target,
-                preserve_markdown,
-            );
-            unique_prompts(match request.style {
-                TranslationStyle::Auto => vec![styled, natural, plain_fallback],
-                TranslationStyle::Natural => vec![styled, plain_fallback, literal],
-                TranslationStyle::Literal => vec![styled, natural, plain_fallback],
-            })
-        };
+        let prompts = PromptPlan {
+            text: body,
+            target: request.target,
+            source: request.source,
+            source_explicit: request.source_explicit,
+            style: request.style,
+            tone: request.tone,
+            family: PromptFamily::for_model(&config.model),
+            is_heading,
+            preserve_markdown,
+        }
+        .ladder();
 
         self.buffered_translation(
             &prompts,
@@ -474,7 +459,7 @@ impl Translator {
             request,
             config,
             BlockOptions {
-                source_language: Some(request.source),
+                source_language: request.source_explicit.then_some(request.source),
                 preserve_line_breaks: false,
                 requires_markdown_structure: false,
             },
@@ -562,25 +547,35 @@ impl Translator {
         let mut failures = 0usize;
         let mut tokens = 0u64;
         let mut seconds = 0.0f64;
+        let family = PromptFamily::for_model(&config.model);
+        let gemma = family == PromptFamily::TranslateGemma && !request.source.is_auto();
         for piece in &pieces {
             check_cancelled(request.cancel.as_ref())?;
-            let prompts = unique_prompts(vec![
-                PromptBuilder::plain_prompt(piece, request.target.english_name),
-                PromptBuilder::prompt(
+            let prompts = if gemma {
+                vec![PromptBuilder::translate_gemma_prompt(
                     piece,
-                    TranslationStyle::Natural,
-                    TranslationTone::Standard,
-                    request.target.english_name,
-                    false,
-                ),
-                PromptBuilder::prompt(
-                    piece,
-                    TranslationStyle::Literal,
-                    TranslationTone::Standard,
-                    request.target.english_name,
-                    false,
-                ),
-            ]);
+                    request.source,
+                    request.target,
+                )]
+            } else {
+                unique_prompts(vec![
+                    PromptBuilder::plain_prompt(piece, request.target.english_name),
+                    PromptBuilder::prompt(
+                        piece,
+                        TranslationStyle::Natural,
+                        TranslationTone::Standard,
+                        request.target.english_name,
+                        false,
+                    ),
+                    PromptBuilder::prompt(
+                        piece,
+                        TranslationStyle::Literal,
+                        TranslationTone::Standard,
+                        request.target.english_name,
+                        false,
+                    ),
+                ])
+            };
             let mut success: Option<String> = None;
             for prompt in &prompts {
                 let retry = retry_config(config, 1);
@@ -1127,20 +1122,6 @@ fn abandon_job(
             degenerate: warnings > 0 && progress.translated_count == 0,
         },
     }
-}
-
-/// Drop repeated prompts while keeping the order of first occurrence.
-///
-/// `Auto` and a non-standard tone describe the same style as `Natural`, so the
-/// ladder would otherwise send a byte-identical request twice per block.
-fn unique_prompts(prompts: Vec<String>) -> Vec<String> {
-    let mut unique: Vec<String> = Vec::with_capacity(prompts.len());
-    for prompt in prompts {
-        if !unique.contains(&prompt) {
-            unique.push(prompt);
-        }
-    }
-    unique
 }
 
 /// Recompose the translated prefix for a partial result.

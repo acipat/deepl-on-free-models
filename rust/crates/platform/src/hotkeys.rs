@@ -10,8 +10,11 @@
 //!
 //! **Threading note:** `global_hotkey` requires the manager to be created on a
 //! thread with an event loop (the main/UI thread on macOS, any message-pumping
-//! thread on Windows).  Create the manager there; the background thread only
-//! reads the global event channel.
+//! thread on Windows).  Create the manager there; the internal background
+//! thread only reads the global event channel.  On Windows the owning thread
+//! must call [`pump_messages`] before every [`HotkeyManager::poll`], because
+//! `RegisterHotKey` posts `WM_HOTKEY` to a window owned by that thread and a
+//! sleeping thread never dispatches it.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -364,6 +367,49 @@ fn punctuation_code(character: char) -> Option<(&'static str, bool)> {
 }
 
 // --------------------------------------------------------------------------- //
+// Windows message pump
+// --------------------------------------------------------------------------- //
+
+/// Pump pending Win32 messages for the calling thread.
+///
+/// `global_hotkey` registers shortcuts with `RegisterHotKey`, so Windows posts
+/// `WM_HOTKEY` to the hidden window that the crate creates in
+/// [`HotkeyManager::new`].  A window only receives messages while the thread
+/// that created it runs a message loop; `HotkeyManager::poll` merely drains a
+/// channel filled by that window's procedure.  The owning thread must
+/// therefore pump before each poll, otherwise registration succeeds but no
+/// shortcut ever fires.
+///
+/// The pump is non-blocking: it removes and dispatches every message already
+/// queued and returns.  On platforms without Win32 this is a no-op.
+#[cfg(windows)]
+pub fn pump_messages() {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+    };
+
+    let mut message = MSG::default();
+    // SAFETY: `message` is a valid destination for `PeekMessageW`; `None`
+    // selects every window owned by this thread and the zero filters accept
+    // every message.  `PM_REMOVE` removes each message before dispatch, so the
+    // loop always makes progress.
+    while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+        // SAFETY: `PeekMessageW` initialised `message`; translating and
+        // dispatching it is the same work a classic `GetMessageW` loop does.
+        unsafe {
+            let _ = TranslateMessage(&message);
+            let _ = DispatchMessageW(&message);
+        }
+    }
+}
+
+/// Pump pending Win32 messages for the calling thread.
+///
+/// This is a no-op on platforms that do not use a Win32 message loop.
+#[cfg(not(windows))]
+pub fn pump_messages() {}
+
+// --------------------------------------------------------------------------- //
 // Manager
 // --------------------------------------------------------------------------- //
 
@@ -484,6 +530,9 @@ impl HotkeyManager {
     }
 
     /// Actions pressed since the previous call.
+    ///
+    /// Call this on the thread that created the manager, after
+    /// [`pump_messages`], so Windows can dispatch pending `WM_HOTKEY` events.
     pub fn poll(&mut self) -> Vec<String> {
         let mut pressed = Vec::new();
         while let Ok(action) = self.pressed.try_recv() {

@@ -54,12 +54,12 @@
 //! # Platform notes
 //!
 //! `keyring` 3.x ships no credential backend unless a platform feature is
-//! enabled (`windows-native`, `apple-native`, …); without one it hands out an
-//! in-memory mock. [`SecretStore::new`] probes the active backend at runtime and
-//! rejects non-persistent or mock backends, falling back to the file store:
-//! DPAPI-encrypted `secrets.dat` on Windows, an owner-only `secrets.json`
-//! elsewhere. Enabling the upstream features later makes the platform store win
-//! automatically — no code change is needed here.
+//! enabled. `Cargo.toml` turns on `windows-native` for Windows and
+//! `apple-native` for macOS, so the Credential Manager / Keychain is preferred;
+//! Linux stays feature-free on purpose. [`SecretStore::new`] still probes the
+//! active backend at runtime and rejects non-persistent or mock backends,
+//! falling back to the file store: DPAPI-encrypted `secrets.dat` on Windows, an
+//! owner-only `secrets.json` elsewhere.
 //!
 //! # Deliberate differences from the Python port
 //!

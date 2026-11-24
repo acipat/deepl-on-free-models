@@ -2,6 +2,52 @@
 //!
 //! Exactly one of the three modules below is compiled.
 
+/// `S_OK` (`0`), the HRESULT returned by `ISpVoice::WaitUntilDone` when the
+/// voice finished speaking.
+const S_OK_HRESULT: i32 = 0;
+/// `S_FALSE` (`1`), the HRESULT returned by `ISpVoice::WaitUntilDone` when the
+/// timeout expired while the voice is still speaking.
+const S_FALSE_HRESULT: i32 = 1;
+
+/// How `ISpVoice::WaitUntilDone` ended, decoded from its raw `HRESULT`.
+///
+/// The `windows` crate wraps the call in `Result`, whose `is_ok()` is true for
+/// every success code, so `S_FALSE` would look like completion.  The raw value
+/// has to be classified instead.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitOutcome {
+    /// `S_OK`: every queued utterance has finished.
+    Finished,
+    /// `S_FALSE`: the timeout elapsed and the voice is still speaking.
+    Speaking,
+    /// A failure `HRESULT`: SAPI could not report the voice state.
+    Failed,
+}
+
+/// Classify the raw `HRESULT` returned by `WaitUntilDone(0)`.
+///
+/// Microsoft documents `S_OK` and `S_FALSE` as the two success results; the
+/// SAPI automation wrapper exposes the same call as a Boolean where `True`
+/// means the voice finished and `False` means the time interval elapsed, so
+/// `S_FALSE` means "still speaking".  See
+/// <https://learn.microsoft.com/en-us/previous-versions/windows/desktop/ms719834(v=vs.85)>
+/// and
+/// <https://learn.microsoft.com/en-us/previous-versions/windows/desktop/ee125654(v=vs.85)>.
+/// `FAILED(hr)` is any negative code.  Unknown success codes cannot be
+/// interpreted, so they are treated as [`WaitOutcome::Failed`] rather than
+/// letting the UI claim the utterance ended.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wait_outcome(hresult: i32) -> WaitOutcome {
+    if hresult == S_OK_HRESULT {
+        WaitOutcome::Finished
+    } else if hresult == S_FALSE_HRESULT {
+        WaitOutcome::Speaking
+    } else {
+        WaitOutcome::Failed
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use std::io::Write;
@@ -153,7 +199,7 @@ mod windows {
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
-    use windows::core::{w, GUID, PCWSTR, PWSTR};
+    use windows::core::{w, Interface, GUID, PCWSTR, PWSTR};
     use windows::Win32::Media::Speech::{
         ISpObjectToken, ISpObjectTokenCategory, ISpVoice, SPF_ASYNC, SPF_IS_XML,
         SPF_PURGEBEFORESPEAK,
@@ -164,6 +210,7 @@ mod windows {
     };
 
     use super::super::{truncate, MAX_CHARS};
+    use super::{wait_outcome, WaitOutcome};
 
     const CLSID_SP_VOICE: GUID = GUID::from_u128(0x96749377_3391_11d2_9ee3_00c04f797396);
     const CLSID_SP_OBJECT_TOKEN_CATEGORY: GUID =
@@ -354,9 +401,26 @@ mod windows {
                 }
                 Ok(Command::Shutdown) => break,
                 Err(RecvTimeoutError::Timeout) => {
-                    // SAFETY: polling with a zero timeout only inspects state.
-                    let done = unsafe { voice.WaitUntilDone(0) }.is_ok();
-                    speaking.store(!done, Ordering::SeqCst);
+                    // The safe wrapper returns `Result<()>` and considers every
+                    // successful HRESULT to be `Ok`, so it cannot distinguish
+                    // `S_OK` (finished) from `S_FALSE` (zero timeout elapsed,
+                    // still speaking).  Call the vtable slot directly to keep
+                    // the raw HRESULT; the wrapper does exactly the same COM
+                    // call internally.
+                    // SAFETY: `voice` is a live `ISpVoice` created and used on
+                    // this worker thread, and `WaitUntilDone` takes no pointers
+                    // besides the interface pointer, which remains valid.
+                    let hresult = unsafe {
+                        (Interface::vtable(&voice).WaitUntilDone)(Interface::as_raw(&voice), 0)
+                    };
+                    match wait_outcome(hresult.0) {
+                        WaitOutcome::Finished => speaking.store(false, Ordering::SeqCst),
+                        WaitOutcome::Speaking => speaking.store(true, Ordering::SeqCst),
+                        WaitOutcome::Failed => {
+                            log::debug!("SAPI WaitUntilDone failed: {hresult:?}");
+                            speaking.store(false, Ordering::SeqCst);
+                        }
+                    }
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
             }
@@ -546,3 +610,40 @@ pub use windows::Speaker;
 
 #[cfg(not(any(windows, target_os = "macos")))]
 pub use unsupported::Speaker;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wait_until_done_s_ok_means_finished() {
+        assert_eq!(wait_outcome(S_OK_HRESULT), WaitOutcome::Finished);
+        assert_eq!(wait_outcome(0), WaitOutcome::Finished);
+    }
+
+    #[test]
+    fn wait_until_done_s_false_means_still_speaking() {
+        // The regression: `S_FALSE` (timeout expired) is a success HRESULT,
+        // but it means the voice is still reading, not that it finished.
+        assert_eq!(wait_outcome(S_FALSE_HRESULT), WaitOutcome::Speaking);
+        assert_eq!(wait_outcome(1), WaitOutcome::Speaking);
+    }
+
+    #[test]
+    fn wait_until_done_failed_hresult_is_an_error() {
+        assert_eq!(
+            wait_outcome(0x8000_4005u32 as i32),
+            WaitOutcome::Failed,
+            "E_FAIL must not be mistaken for completion"
+        );
+        assert_eq!(wait_outcome(E_UNEXPECTED as i32), WaitOutcome::Failed);
+    }
+
+    #[test]
+    fn unknown_success_code_is_not_claimed_as_finished() {
+        assert_eq!(wait_outcome(2), WaitOutcome::Failed);
+    }
+
+    /// `E_UNEXPECTED`: a representative failure code.
+    const E_UNEXPECTED: u32 = 0x8000_FFFF;
+}

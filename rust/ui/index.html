@@ -893,6 +893,21 @@
                 </span>
               </label>
 
+              <div id="loginItem">
+                <label class="switch-row">
+                  <span class="switch-row-text" data-i18n="Open at login"></span>
+                  <span class="switch">
+                    <input type="checkbox" id="loginItemToggle">
+                    <span class="switch-track" aria-hidden="true"></span>
+                  </span>
+                </label>
+                <p class="hotkey-error" id="loginItemError" hidden></p>
+                <div id="loginItemApproval" hidden>
+                  <p class="hint" data-i18n="Allow DeepL-oFM to open at login in System Settings."></p>
+                  <button class="btn btn-secondary btn-sm" type="button" id="loginItemSettings" data-i18n="Open System Settings"></button>
+                </div>
+              </div>
+
               <label class="switch-row switch-row-hint">
                 <span class="switch-row-label">
                   <span class="switch-row-text" data-i18n="Load the translator at launch"></span>

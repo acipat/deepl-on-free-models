@@ -7,6 +7,43 @@
 
 use crate::providers::Provider;
 
+/// Prompt wording a model was trained on.
+///
+/// Hy-MT2 and TranslateGemma publish different instructions. The translator
+/// selects the family from the model id so a catalogue model receives the
+/// wording its authors documented instead of the Hy-MT2 text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PromptFamily {
+    /// Tencent's Hy-MT2, trained on the wording of `Prompt.swift`.
+    HyMt,
+    /// Google's TranslateGemma, which publishes its own instruction:
+    /// <https://ollama.com/library/translategemma#prompt-guide>.
+    TranslateGemma,
+    /// Any other model. No other card is known, so the generic Hy-MT2 wording
+    /// is kept rather than inventing a format.
+    #[default]
+    Default,
+}
+
+impl PromptFamily {
+    /// Pick the family for a model id.
+    ///
+    /// A tag (`:7b`), a digest (`@sha256:…`) and a registry namespace
+    /// (`maternion/hy-mt2:7b`, `tencent/hy-mt2-1.8b`) are ignored.
+    pub fn for_model(model_id: &str) -> Self {
+        let lowered = model_id.trim().to_ascii_lowercase();
+        let name = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
+        let name = name.split([':', '@']).next().unwrap_or(name);
+        if name.starts_with("translategemma") {
+            Self::TranslateGemma
+        } else if name.starts_with("hy-mt2") {
+            Self::HyMt
+        } else {
+            Self::Default
+        }
+    }
+}
+
 /// One model the app knows how to apply with a single click.
 #[derive(Clone, Copy, Debug)]
 pub struct CatalogEntry {
@@ -420,6 +457,13 @@ impl ModelCatalog {
         }
     }
 
+    /// Prompt wording family for `model_id`.
+    ///
+    /// See [`PromptFamily`]; unknown ids keep the generic Hy-MT2 instruction.
+    pub fn prompt_family(model_id: &str) -> PromptFamily {
+        PromptFamily::for_model(model_id)
+    }
+
     /// Entries relevant to a provider, mirroring `ModelCatalog.entries(for:)`.
     pub fn for_provider(provider: Provider) -> Vec<&'static CatalogEntry> {
         let group: &'static [CatalogEntry] = match provider {
@@ -477,6 +521,38 @@ mod tests {
         ("gpt-oss-120b", &["Free tier", "~3000 t/s", "120B"]),
         ("qwen-3.8-27b", &["Free tier", "~1850 t/s"]),
     ];
+
+    #[test]
+    fn prompt_family_follows_the_model_id() {
+        assert_eq!(PromptFamily::for_model("hy-mt2:7b"), PromptFamily::HyMt);
+        assert_eq!(
+            PromptFamily::for_model("maternion/hy-mt2:1.8b"),
+            PromptFamily::HyMt
+        );
+        assert_eq!(
+            PromptFamily::for_model("tencent/hy-mt2-7b"),
+            PromptFamily::HyMt
+        );
+        assert_eq!(
+            PromptFamily::for_model("translategemma:4b"),
+            PromptFamily::TranslateGemma
+        );
+        assert_eq!(
+            PromptFamily::for_model("translategemma:12b"),
+            PromptFamily::TranslateGemma
+        );
+        assert_eq!(
+            PromptFamily::for_model("library/TranslateGemma@sha256:abc"),
+            PromptFamily::TranslateGemma
+        );
+        assert_eq!(PromptFamily::for_model("qwen3:8b"), PromptFamily::Default);
+        assert_eq!(PromptFamily::for_model(""), PromptFamily::Default);
+        assert_eq!(
+            ModelCatalog::prompt_family("translategemma:4b"),
+            PromptFamily::TranslateGemma
+        );
+        assert_eq!(ModelCatalog::prompt_family("hy-mt2:7b"), PromptFamily::HyMt);
+    }
 
     #[test]
     fn catalogue_keeps_all_28_entries() {

@@ -13,6 +13,31 @@ pub const fn is_supported() -> bool {
     cfg!(any(windows, target_os = "macos"))
 }
 
+/// UTF-16 capacity of a clipboard block that `GlobalSize` reported as `bytes`.
+///
+/// `None` means the block is too small to hold even one UTF-16 code unit, so
+/// it cannot contain a `CF_UNICODETEXT` string and must not be read.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn clipboard_capacity(bytes: usize) -> Option<usize> {
+    let units = bytes / std::mem::size_of::<u16>();
+    (units > 0).then_some(units)
+}
+
+/// Number of UTF-16 units before the first NUL in a bounded clipboard block.
+///
+/// `units` covers exactly the memory the clipboard owner allocated (its length
+/// is `GlobalSize` divided by two), so a hostile or buggy owner that omits the
+/// terminating NUL cannot make the scan walk past the allocation: the length
+/// is clamped to the block instead.  A normal NUL-terminated clipboard string
+/// stops at its terminator.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn utf16_text_length(units: &[u16]) -> usize {
+    units
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(units.len())
+}
+
 /// Return the text selected in the foreground window, or `None`.
 ///
 /// Blocks for at most the modifier-release grace period plus `timeout`.  On
@@ -56,11 +81,13 @@ mod windows_impl {
     use windows::Win32::System::DataExchange::{
         CloseClipboard, GetClipboardData, GetClipboardSequenceNumber, OpenClipboard,
     };
-    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
         KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_C, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
     };
+
+    use super::{clipboard_capacity, utf16_text_length};
 
     /// Clipboard format for NUL-terminated UTF-16 text.
     const CF_UNICODETEXT: u32 = 13;
@@ -151,16 +178,27 @@ mod windows_impl {
         if pointer.is_null() {
             return None;
         }
+        // SAFETY: `memory` is a live global memory block, so `GlobalSize` only
+        // reports how many bytes the clipboard owner actually allocated.
+        let Some(capacity) = clipboard_capacity(unsafe { GlobalSize(memory) }) else {
+            // A block too small to hold even one UTF-16 unit cannot contain a
+            // string; unlock it and treat the format as unreadable.
+            // SAFETY: `memory` was successfully locked above and is unlocked
+            // exactly once here.
+            let _ = unsafe { GlobalUnlock(memory) };
+            return None;
+        };
         let wide = pointer as *const u16;
-        let mut length = 0usize;
-        // SAFETY: the block is NUL-terminated UTF-16 text.  The cap only guards
-        // against a malformed owner that never terminates the string.
-        while length < 16_000_000 && unsafe { *wide.add(length) } != 0 {
-            length += 1;
-        }
-        // SAFETY: `wide` points at `length` initialised `u16` values inside the
-        // locked block, and the slice does not outlive the unlock below.
-        let text = unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(wide, length)) };
+        // SAFETY: `GlobalSize` returns the size of the whole allocation, so
+        // `wide` points at exactly `capacity` `u16` values inside the locked
+        // block.  Reading that slice is therefore in bounds; the scan below
+        // stops at the first NUL and is clamped to `capacity` for an owner
+        // that never terminates the string.
+        let units = unsafe { std::slice::from_raw_parts(wide, capacity) };
+        let length = utf16_text_length(units);
+        // SAFETY: `length` never exceeds `capacity`, so the slice is inside the
+        // locked allocation.  The borrow ends before the unlock below.
+        let text = String::from_utf16_lossy(&units[..length]);
         // SAFETY: `memory` was successfully locked above and is unlocked once.
         let _ = unsafe { GlobalUnlock(memory) };
         Some(text)
@@ -298,5 +336,36 @@ mod tests {
         assert_eq!(capture(Duration::from_millis(5)), None);
         // A second call must not panic or block either.
         assert_eq!(capture(Duration::ZERO), None);
+    }
+
+    #[test]
+    fn clipboard_capacity_comes_from_the_allocation_size() {
+        // `GlobalSize` is in bytes; the scan is in UTF-16 units.
+        assert_eq!(clipboard_capacity(0), None);
+        assert_eq!(clipboard_capacity(1), None);
+        assert_eq!(clipboard_capacity(2), Some(1));
+        assert_eq!(clipboard_capacity(6), Some(3));
+        // A trailing odd byte is not a whole code unit.
+        assert_eq!(clipboard_capacity(7), Some(3));
+    }
+
+    #[test]
+    fn clipboard_text_stops_at_the_first_nul() {
+        // The trailing junk after the terminator is part of the allocation but
+        // is not text.
+        assert_eq!(
+            utf16_text_length(&[u16::from(b'a'), u16::from(b'b'), 0, u16::from(b'c')]),
+            2
+        );
+        // A leading NUL is an empty string, not a 0-length malformed read.
+        assert_eq!(utf16_text_length(&[0, u16::from(b'x')]), 0);
+    }
+
+    #[test]
+    fn clipboard_text_is_clamped_to_the_allocation() {
+        // No terminator: `GlobalSize` bounds the read, so the whole block is
+        // consumed instead of scanning past it forever.
+        assert_eq!(utf16_text_length(&[0x41; 4]), 4);
+        assert_eq!(utf16_text_length(&[]), 0);
     }
 }
