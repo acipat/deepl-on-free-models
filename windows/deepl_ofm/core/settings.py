@@ -63,6 +63,7 @@ _PERSISTED_FIELDS: tuple[str, ...] = (
     "repetition_penalty",
     "context_window",
     "auto_translate",
+    "translate_in_one_request",
     "debounce",
     "hot_key",
     "selection_hot_key",
@@ -104,6 +105,7 @@ _ALIASES: dict[str, str] = {
     "repetitionPenalty": "repetition_penalty",
     "contextWindow": "context_window",
     "autoTranslate": "auto_translate",
+    "translateInOneRequest": "translate_in_one_request",
     "hotKey": "hot_key",
     "selectionHotKey": "selection_hot_key",
     "showInMenuBar": "show_in_menu_bar",
@@ -140,6 +142,7 @@ def _default_values() -> dict[str, Any]:
         "repetition_penalty": 1.05,
         "context_window": 8192,
         "auto_translate": True,
+        "translate_in_one_request": True,
         "debounce": 0.45,
         "hot_key": KeyCombo.standard(),
         "selection_hot_key": KeyCombo.selection(),
@@ -378,6 +381,9 @@ class AppSettings:
         )
         values["auto_translate"] = _as_bool(
             flat.get("auto_translate"), defaults["auto_translate"]
+        )
+        values["translate_in_one_request"] = _as_bool(
+            flat.get("translate_in_one_request"), defaults["translate_in_one_request"]
         )
         values["debounce"] = _as_float(flat.get("debounce"), defaults["debounce"])
         values["hot_key"] = _as_keycombo(flat.get("hot_key"), defaults["hot_key"])
@@ -679,6 +685,18 @@ class AppSettings:
     @auto_translate.setter
     def auto_translate(self, value: bool) -> None:
         self._set("auto_translate", _as_bool(value, self._values["auto_translate"]))
+
+    @property
+    def translate_in_one_request(self) -> bool:
+        """Translate the text pane in one request before retrying by block."""
+        return self._values["translate_in_one_request"]
+
+    @translate_in_one_request.setter
+    def translate_in_one_request(self, value: bool) -> None:
+        self._set(
+            "translate_in_one_request",
+            _as_bool(value, self._values["translate_in_one_request"]),
+        )
 
     @property
     def debounce(self) -> float:

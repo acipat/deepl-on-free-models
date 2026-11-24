@@ -106,6 +106,22 @@ impl TextChunker {
         text.replace("\r\n", "\n").replace('\r', "\n")
     }
 
+    /// Iterate over normalised lines and mark fenced code, including the fences.
+    pub fn lines_with_code(text: &str) -> impl Iterator<Item = (&str, bool)> {
+        let mut open = None;
+        text.split('\n').map(move |line| {
+            if let Some(marker) = open {
+                if closes_fence(line, marker) {
+                    open = None;
+                }
+                (line, true)
+            } else {
+                open = fence_marker(line);
+                (line, open.is_some())
+            }
+        })
+    }
+
     /// Split `text` into one chunk per non-empty line.
     ///
     /// Leading and trailing blank lines are dropped (Swift behaviour); the

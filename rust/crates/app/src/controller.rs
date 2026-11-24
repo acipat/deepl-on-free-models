@@ -36,7 +36,7 @@ use ofm_text::{PromptBuilder, TranslationStyle, TranslationTone};
 use crate::state::{AppEvent, AppState, BackendStatus, FileJob, FileJobState, WriteState};
 
 /// Upper bound for the translated-text cache: one entry is enough.
-type CacheKey = (String, String, String, String, String, String);
+type CacheKey = (String, String, String, String, String, String, bool);
 
 /// Minimum gap between two streaming repaints of the result pane.
 ///
@@ -2288,9 +2288,13 @@ fn translate_now(inner: &Arc<Inner>, force: bool) {
             state.tone.clone(),
         )
     };
-    let (config, fallback) = {
+    let (config, fallback, one_request) = {
         let settings = inner.settings.read().unwrap_or_else(|p| p.into_inner());
-        (settings.snapshot(), settings.fallback_config())
+        (
+            settings.snapshot(),
+            settings.fallback_config(),
+            settings.translate_in_one_request,
+        )
     };
 
     if text.trim().is_empty() {
@@ -2312,6 +2316,7 @@ fn translate_now(inner: &Arc<Inner>, force: bool) {
         style_value.clone(),
         tone_value.clone(),
         config.model.clone(),
+        one_request,
     );
     // A cache hit only means "the pane already shows this exact result". If the
     // text was cleared and retyped the pane is empty, so the request must run.
@@ -2430,7 +2435,7 @@ fn translate_now(inner: &Arc<Inner>, force: bool) {
             }
             {
                 let mut last = last_partial.lock().unwrap_or_else(|p| p.into_inner());
-                if last.elapsed() < PARTIAL_INTERVAL {
+                if !chunk.is_empty() && last.elapsed() < PARTIAL_INTERVAL {
                     return;
                 }
                 *last = Instant::now();
@@ -2471,7 +2476,7 @@ fn translate_now(inner: &Arc<Inner>, force: bool) {
             on_partial: Some(partial),
         };
 
-        let outcome = worker.translator.translate(request).await;
+        let outcome = worker.translator.translate_text(request, one_request).await;
 
         // A newer job superseded this one: drop the result silently.
         let current_job = worker.cancel.lock().unwrap_or_else(|p| p.into_inner());
@@ -3741,7 +3746,7 @@ mod file_tests {
     /// history and metrics only ever see the final output.
     #[test]
     fn streaming_partials_reach_the_pane_without_becoming_the_result() {
-        let backend = fake_backend::FakeBackend::start("Hallo Welt, dies ist eine Übersetzung.");
+        let backend = fake_backend::FakeBackend::start("Hallo Welt.\n\nZweiter Absatz.");
         let fixture = Fixture::new("streaming");
         fixture.use_backend(&backend, "test-model");
         let controller = &fixture.controller;

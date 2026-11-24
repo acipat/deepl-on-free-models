@@ -33,15 +33,15 @@ use ofm_text::{
 use crate::budget::OutputBudget;
 use crate::error::{http_error, ErrorKind, TranslationError};
 use crate::pipeline::{
-    contains_markdown, is_letter, markdown_structure, split_mixed_line, validated,
+    contains_markdown, is_letter, markdown_structure, split_mixed_line, validated, validated_whole,
     with_source_language,
 };
 use crate::probe::probe_models;
-use crate::prompt::{unique_prompts, PromptPlan};
-use crate::request::{CancelFlag, TranslateRequest, TranslationOutput};
+use crate::prompt::{unique_prompts, whole_text_prompt, PromptPlan};
+use crate::request::{CancelFlag, PartialFn, TranslateRequest, TranslationOutput};
 use crate::wire::{
     chat_endpoint, consume_ollama, consume_openai, json_headers, ollama_body, ollama_warm_up_body,
-    openai_body, openai_warm_up_body, Protocol,
+    openai_body, openai_trailer, openai_warm_up_body, GenerationStats, Protocol,
 };
 
 /// Connect timeout, like `_CONNECT_TIMEOUT` in the Python module.
@@ -52,6 +52,8 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 const CANCEL_POLL: Duration = Duration::from_millis(40);
 /// Pause before a lowered-temperature retry (Python: 0.120 s).
 const RETRY_DELAY: Duration = Duration::from_millis(120);
+/// Coalesce the streamed preview before copying the accumulated text.
+const PREVIEW_INTERVAL: Duration = Duration::from_millis(120);
 /// Largest streamed line accepted before the response is declared broken.
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 /// Byte cap for one `rewrite` response.
@@ -97,6 +99,16 @@ impl Translator {
         &self,
         request: TranslateRequest<'_>,
     ) -> Result<TranslationOutput, TranslationError> {
+        self.translate_text(request, false).await
+    }
+
+    /// Translate text in a single request when enabled and the input fits.
+    /// Fall back to block translation when the entire reply cannot be used.
+    pub async fn translate_text(
+        &self,
+        request: TranslateRequest<'_>,
+        one_request: bool,
+    ) -> Result<TranslationOutput, TranslationError> {
         let started = Instant::now();
         check_cancelled(request.cancel.as_ref())?;
         if request.text.trim().is_empty() {
@@ -107,7 +119,7 @@ impl Translator {
             });
         }
 
-        let primary = self.run_job(&request, request.config).await;
+        let primary = self.run_job(&request, request.config, one_request).await;
         let (job, used_fallback) = match primary {
             Ok(job) => {
                 // Swift retries the whole job when no block was translated.
@@ -115,7 +127,7 @@ impl Translator {
                     Some(fallback) if job.degenerate => {
                         log::info!("no block translated; retrying on the fallback backend");
                         emit_partial(&request.on_partial, "");
-                        match self.run_job(&request, fallback).await {
+                        match self.run_job(&request, fallback, one_request).await {
                             Ok(fallback_job) => (fallback_job, true),
                             Err(failure) => {
                                 if failure.error.kind == ErrorKind::Cancelled
@@ -148,7 +160,7 @@ impl Translator {
                     failure.error
                 );
                 emit_partial(&request.on_partial, "");
-                match self.run_job(&request, fallback).await {
+                match self.run_job(&request, fallback, one_request).await {
                     Ok(fallback_job) => (fallback_job, true),
                     Err(fallback_failure) => {
                         if fallback_failure.error.kind == ErrorKind::Cancelled
@@ -171,7 +183,7 @@ impl Translator {
         Ok(TranslationOutput {
             text: job.text,
             warnings: job.warnings,
-            tokens_per_second: rate(job.tokens, job.seconds),
+            tokens_per_second: rate(job.stats),
             duration_ms: Some(elapsed_ms(started)),
             used_fallback,
         })
@@ -242,7 +254,7 @@ impl Translator {
         Ok(TranslationOutput {
             text: result.text,
             warnings: 0,
-            tokens_per_second: rate(result.tokens, result.seconds),
+            tokens_per_second: rate(result.stats),
             duration_ms: Some(elapsed_ms(started)),
             used_fallback,
         })
@@ -306,8 +318,86 @@ impl Translator {
         &self,
         request: &TranslateRequest<'_>,
         config: &BackendConfig,
+        one_request: bool,
     ) -> Result<JobResult, JobFailure> {
-        let chunks = TextChunker::split(&TextChunker::normalize(request.text));
+        let normalized = TextChunker::normalize(request.text);
+        let mut rejected_whole_prompt = None;
+        if one_request {
+            if let Some((prompt, output_limit)) = whole_text_prompt(
+                &normalized,
+                request.source,
+                request.source_explicit,
+                request.target,
+                request.style,
+                request.tone,
+                config,
+            ) {
+                report(&request.on_progress, 0, 1);
+                let max_bytes = normalized
+                    .chars()
+                    .count()
+                    .saturating_mul(4)
+                    .saturating_add(100)
+                    .max(200)
+                    * 4;
+                let whole = WholeRequest {
+                    output_limit,
+                    on_partial: request.on_partial.as_ref(),
+                };
+                let result = stream_chat(
+                    &self.client,
+                    &prompt,
+                    config,
+                    request.cancel.as_ref(),
+                    max_bytes,
+                    Some(whole),
+                )
+                .await;
+                match result {
+                    Ok(raw) => {
+                        if !raw.exceeded_limit {
+                            if let Some(text) =
+                                validated_whole(&raw.text, &normalized, request.target)
+                            {
+                                check_cancelled(request.cancel.as_ref()).map_err(|error| {
+                                    JobFailure {
+                                        error,
+                                        partial: JobResult::default(),
+                                    }
+                                })?;
+                                emit_partial(&request.on_partial, &text);
+                                report(&request.on_progress, 1, 1);
+                                return Ok(JobResult {
+                                    text,
+                                    stats: raw.stats,
+                                    ..JobResult::default()
+                                });
+                            }
+                        }
+                    }
+                    Err(error)
+                        if error.kind == ErrorKind::Empty
+                            || error.status == Some(413)
+                            || (error.kind == ErrorKind::Http
+                                && is_context_limit(&error.detail)) => {}
+                    Err(error) => {
+                        emit_partial(&request.on_partial, "");
+                        return Err(JobFailure {
+                            error,
+                            partial: JobResult {
+                                text: request.text.to_string(),
+                                warnings: 1,
+                                degenerate: true,
+                                ..JobResult::default()
+                            },
+                        });
+                    }
+                }
+                emit_partial(&request.on_partial, "");
+                rejected_whole_prompt = Some(prompt);
+            }
+        }
+        let chunks = TextChunker::split(&normalized);
         if chunks.is_empty() {
             return Ok(JobResult {
                 text: request.text.to_string(),
@@ -320,8 +410,7 @@ impl Translator {
         let mut translated: Vec<String> = Vec::with_capacity(total);
         let mut warnings = 0usize;
         let mut translated_count = 0usize;
-        let mut tokens = 0u64;
-        let mut seconds = 0.0f64;
+        let mut stats = Some((0, 0.0));
 
         for (index, chunk) in chunks.iter().enumerate() {
             if let Err(error) = check_cancelled(request.cancel.as_ref()) {
@@ -333,8 +422,7 @@ impl Translator {
                     JobProgress {
                         warnings,
                         translated_count,
-                        tokens,
-                        seconds,
+                        stats,
                     },
                 ));
             }
@@ -363,6 +451,7 @@ impl Translator {
                     config,
                     contains_markdown(&line),
                     chunk.is_heading,
+                    rejected_whole_prompt.as_deref(),
                 )
                 .await
             {
@@ -388,8 +477,7 @@ impl Translator {
                         JobProgress {
                             warnings,
                             translated_count,
-                            tokens,
-                            seconds,
+                            stats,
                         },
                     ));
                 }
@@ -407,8 +495,7 @@ impl Translator {
                     ),
                 };
             translated.push(format!("{keep}{translated_text}"));
-            tokens += block.tokens;
-            seconds += block.seconds;
+            stats = sum_stats(stats, block.stats);
             if warning {
                 warnings += 1;
             } else {
@@ -424,8 +511,7 @@ impl Translator {
         Ok(JobResult {
             text: TextChunker::compose(&chunks, &translated).unwrap_or_default(),
             warnings,
-            tokens,
-            seconds,
+            stats,
             degenerate: warnings > 0 && translated_count == 0,
         })
     }
@@ -438,6 +524,7 @@ impl Translator {
         config: &BackendConfig,
         preserve_markdown: bool,
         is_heading: bool,
+        rejected_whole_prompt: Option<&str>,
     ) -> Result<BlockResult, TranslationError> {
         let body = text.trim();
         let plan = PromptPlan {
@@ -459,6 +546,7 @@ impl Translator {
             BlockOptions {
                 preserve_line_breaks: false,
                 requires_markdown_structure: false,
+                rejected_whole_prompt,
             },
         )
         .await
@@ -470,7 +558,7 @@ impl Translator {
         plan: PromptPlan<'_>,
         request: &TranslateRequest<'_>,
         config: &BackendConfig,
-        options: BlockOptions,
+        options: BlockOptions<'_>,
     ) -> Result<BlockResult, TranslationError> {
         let source = plan.text;
         let source_count = source.chars().count();
@@ -478,6 +566,9 @@ impl Translator {
 
         for (index, prompt) in plan.ladder().into_iter().enumerate() {
             let prompt = with_source_language(prompt, plan.source_hint());
+            if options.rejected_whole_prompt == Some(prompt.as_str()) {
+                continue;
+            }
             let attempts = if index == 0 { 3 } else { 2 };
             for attempt in 0..attempts {
                 if attempt > 0 {
@@ -505,8 +596,7 @@ impl Translator {
                 return Ok(BlockResult {
                     text: clean,
                     warning: false,
-                    tokens: raw.tokens,
-                    seconds: raw.seconds,
+                    stats: raw.stats,
                 });
             }
         }
@@ -539,8 +629,7 @@ impl Translator {
 
         let mut translated: Vec<String> = Vec::with_capacity(pieces.len());
         let mut failures = 0usize;
-        let mut tokens = 0u64;
-        let mut seconds = 0.0f64;
+        let mut stats = Some((0, 0.0));
         for piece in &pieces {
             check_cancelled(request.cancel.as_ref())?;
             let prompts = if let Some(prompt) = plan.gemma_prompt(piece) {
@@ -580,8 +669,7 @@ impl Translator {
                     .await?;
                 if let Some(clean) = validated(&raw.text, piece, request.target, false) {
                     success = Some(clean);
-                    tokens += raw.tokens;
-                    seconds += raw.seconds;
+                    stats = sum_stats(stats, raw.stats);
                     break;
                 }
             }
@@ -600,8 +688,7 @@ impl Translator {
         Ok(Some(BlockResult {
             text: translated.join(" "),
             warning: failures > 0,
-            tokens,
-            seconds,
+            stats,
         }))
     }
 
@@ -613,7 +700,7 @@ impl Translator {
         max_bytes: usize,
         cancel: Option<&CancelFlag>,
     ) -> Result<ChatResult, TranslationError> {
-        match stream_chat(&self.client, prompt, config, cancel, max_bytes).await {
+        match stream_chat(&self.client, prompt, config, cancel, max_bytes, None).await {
             // Python's `_collect_with_retry` raises `empty` for a byte-cap
             // overrun and `_collect_candidate` turns *any* `empty` into an
             // empty candidate, so the prompt ladder keeps going. Doing
@@ -641,7 +728,15 @@ impl Translator {
         on_progress: &Option<crate::request::ProgressFn>,
     ) -> Result<ChatResult, TranslationError> {
         report(on_progress, 0, 1);
-        let result = stream_chat(&self.client, prompt, config, cancel, REWRITE_MAX_BYTES).await?;
+        let result = stream_chat(
+            &self.client,
+            prompt,
+            config,
+            cancel,
+            REWRITE_MAX_BYTES,
+            None,
+        )
+        .await?;
         if result.exceeded_limit {
             return Err(
                 TranslationError::new(ErrorKind::Empty).with_detail("rewrite output too long")
@@ -665,17 +760,17 @@ impl Translator {
 
 /// Options shared by the buffered (block) translation ladder.
 #[derive(Clone, Copy)]
-struct BlockOptions {
+struct BlockOptions<'a> {
     preserve_line_breaks: bool,
     requires_markdown_structure: bool,
+    rejected_whole_prompt: Option<&'a str>,
 }
 
 /// One translated block.
 struct BlockResult {
     text: String,
     warning: bool,
-    tokens: u64,
-    seconds: f64,
+    stats: Option<GenerationStats>,
 }
 
 /// One finished job, before the public output is built.
@@ -683,8 +778,7 @@ struct BlockResult {
 struct JobResult {
     text: String,
     warnings: usize,
-    tokens: u64,
-    seconds: f64,
+    stats: Option<GenerationStats>,
     degenerate: bool,
 }
 
@@ -698,17 +792,20 @@ struct JobFailure {
 struct JobProgress {
     warnings: usize,
     translated_count: usize,
-    tokens: u64,
-    seconds: f64,
+    stats: Option<GenerationStats>,
 }
 
 /// One streamed candidate.
 #[derive(Default)]
 struct ChatResult {
     text: String,
-    tokens: u64,
-    seconds: f64,
+    stats: Option<GenerationStats>,
     exceeded_limit: bool,
+}
+
+struct WholeRequest<'a> {
+    output_limit: u32,
+    on_partial: Option<&'a PartialFn>,
 }
 
 // ----------------------------------------------------------------- streaming
@@ -724,6 +821,7 @@ async fn stream_chat(
     config: &BackendConfig,
     cancel: Option<&CancelFlag>,
     max_bytes: usize,
+    whole: Option<WholeRequest<'_>>,
 ) -> Result<ChatResult, TranslationError> {
     if config.model.trim().is_empty() {
         return Err(TranslationError::new(ErrorKind::Model));
@@ -737,18 +835,19 @@ async fn stream_chat(
     let (url, protocol) = chat_endpoint(&base, config.kind);
     validate_url(&url, &base)?;
     let headers = json_headers(config, &base)?;
-    let request = match config.kind {
-        BackendKind::Ollama => client
-            .post(&url)
-            .headers(headers)
-            .json(&ollama_body(prompt, config)),
-        BackendKind::OpenAI => client
-            .post(&url)
-            .headers(headers)
-            .json(&openai_body(prompt, config)),
+    let request = client.post(&url).headers(headers);
+    let output_limit = whole.as_ref().map(|request| request.output_limit);
+    let (request, requests_usage) = match config.kind {
+        BackendKind::Ollama => (
+            request.json(&ollama_body(prompt, config).with_output_limit(output_limit)),
+            false,
+        ),
+        BackendKind::OpenAI => {
+            let body = openai_body(prompt, config).with_output_limit(output_limit);
+            (request.json(&body), body.requests_usage())
+        }
     };
 
-    let started = Instant::now();
     // The request itself must be cancellable: a server that accepts the
     // connection and stalls would otherwise keep the Cancel button inert for
     // the whole connect + read timeout.
@@ -760,14 +859,34 @@ async fn stream_chat(
     let mut response = sent.map_err(|error| request_error(&error, &base))?;
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
+        if whole.is_some() && matches!(status, 400 | 422) {
+            // Chat APIs normally send a small JSON error body for a context limit.
+            let first_chunk = tokio::select! {
+                biased;
+                () = cancel_signal(cancel) => return Err(TranslationError::new(ErrorKind::Cancelled)),
+                chunk = response.chunk() => chunk,
+            };
+            if let Ok(Some(bytes)) = first_chunk {
+                let body = String::from_utf8_lossy(&bytes[..bytes.len().min(16_384)]);
+                if is_context_limit(&body) {
+                    return Err(
+                        TranslationError::new(ErrorKind::Empty).with_detail("context limit")
+                    );
+                }
+            }
+        }
         let detail = status_detail(status, &response, config);
         return Err(http_error(status, &detail));
     }
 
     let mut reader = LineReader::default();
-    let mut emitter = Emitter::new(max_bytes);
-    let mut server_stats: Option<(u64, f64)> = None;
+    let mut emitter = Emitter::new(
+        max_bytes,
+        whole.as_ref().and_then(|request| request.on_partial),
+    );
+    let mut server_stats = None;
     let mut finished = false;
+    let mut stream_terminal = false;
 
     'stream: loop {
         check_cancelled(cancel)?;
@@ -776,34 +895,40 @@ async fn stream_chat(
             () = cancel_signal(cancel) => return Err(TranslationError::new(ErrorKind::Cancelled)),
             chunk = response.chunk() => chunk,
         };
-        let Some(bytes) = next.map_err(|error| stream_error(&error, cancel))? else {
-            break;
+        let bytes = match next {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => break,
+            // The answer is complete even if the optional stats trailer is lost.
+            Err(_) if finished => break,
+            Err(error) => return Err(stream_error(&error, cancel)),
         };
         reader.push(&bytes);
         while let Some(line) = reader.next_line()? {
             if line.trim().is_empty() {
                 continue;
             }
-            let (terminal, stats) = consume(&protocol, &line, &mut emitter)?;
-            if let Some(stats) = stats {
-                server_stats = Some(stats);
-            }
-            if terminal {
-                finished = true;
+            let (terminal, stats) = consume(protocol, &line, &mut emitter, finished)?;
+            server_stats = stats.or(server_stats);
+            finished |= terminal;
+            // A requested usage trailer may follow the choice's finish_reason.
+            stream_terminal = finished
+                && (!requests_usage
+                    || emitter.stopped
+                    || server_stats.is_some()
+                    || openai_trailer(&line));
+            if stream_terminal {
                 break 'stream;
             }
         }
     }
 
     // A terminal frame may arrive without its trailing newline.
-    if !finished {
+    if !stream_terminal {
         if let Some(line) = reader.finish() {
             if !line.trim().is_empty() {
-                let (terminal, stats) = consume(&protocol, &line, &mut emitter)?;
-                if let Some(stats) = stats {
-                    server_stats = Some(stats);
-                }
-                finished = terminal;
+                let (terminal, stats) = consume(protocol, &line, &mut emitter, finished)?;
+                server_stats = stats.or(server_stats);
+                finished |= terminal;
             }
         }
     }
@@ -814,72 +939,76 @@ async fn stream_chat(
             .with_detail("stream ended without a terminal event"));
     }
 
-    let elapsed = started.elapsed().as_secs_f64();
-    let span = match (emitter.first_at, emitter.last_at) {
-        (Some(first), Some(last)) => last.saturating_duration_since(first).as_secs_f64(),
-        _ => 0.0,
-    };
-    let (server_tokens, server_seconds) = match server_stats {
-        Some((tokens, seconds)) => (Some(tokens), Some(seconds)),
-        None => (None, None),
-    };
-    let generation_seconds = match server_seconds {
-        Some(seconds) if seconds > 0.0 => seconds,
-        _ if span > 0.0 => span,
-        // Instant fake or real streams still get a measurable rate.
-        _ if emitter.tokens > 0 => elapsed.max(0.001),
-        _ => 0.0,
-    };
-    let total_tokens = server_tokens.unwrap_or(emitter.tokens);
-
     Ok(ChatResult {
         text: emitter.budget.text(),
-        tokens: total_tokens,
-        seconds: generation_seconds,
-        exceeded_limit: emitter.budget.exceeded_limit(),
+        stats: server_stats,
+        exceeded_limit: emitter.budget.exceeded_limit() || whole.is_some() && emitter.stopped,
     })
+}
+
+fn is_context_limit(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    [
+        "context_length_exceeded",
+        "maximum context length",
+        "context window exceeded",
+        "exceeds the context window",
+        "too many input tokens",
+        "input is too long",
+        "input too long",
+        "prompt too long",
+        "prompt is too long",
+    ]
+    .iter()
+    .any(|message| detail.contains(message))
 }
 
 /// Feed one frame to the protocol decoder with the stream accumulator.
 fn consume(
-    protocol: &Protocol,
+    protocol: Protocol,
     line: &str,
-    emitter: &mut Emitter,
+    emitter: &mut Emitter<'_>,
+    finished: bool,
 ) -> Result<crate::wire::FrameOutcome, TranslationError> {
+    let mut emit = |piece: &str| finished || emitter.emit(piece);
     match protocol {
-        Protocol::Ollama => consume_ollama(line, &mut |piece| emitter.emit(piece)),
-        Protocol::OpenAi => consume_openai(line, &mut |piece| emitter.emit(piece)),
+        Protocol::Ollama => consume_ollama(line, &mut emit),
+        Protocol::OpenAi => consume_openai(line, &mut emit),
     }
 }
 
-/// Accumulates streamed text and timing for one response.
-struct Emitter {
+/// Accumulates streamed text for one response.
+struct Emitter<'a> {
     budget: OutputBudget,
-    tokens: u64,
-    first_at: Option<Instant>,
-    last_at: Option<Instant>,
+    stopped: bool,
+    on_partial: Option<&'a PartialFn>,
+    last_preview: Option<Instant>,
 }
 
-impl Emitter {
-    fn new(max_bytes: usize) -> Self {
+impl<'a> Emitter<'a> {
+    fn new(max_bytes: usize, on_partial: Option<&'a PartialFn>) -> Self {
         Self {
             budget: OutputBudget::new(max_bytes),
-            tokens: 0,
-            first_at: None,
-            last_at: None,
+            stopped: false,
+            on_partial,
+            last_preview: None,
         }
     }
 
     /// Append one piece; returns `false` when generation must stop.
     fn emit(&mut self, piece: &str) -> bool {
-        let now = Instant::now();
-        let keep_going = self.budget.append(piece);
-        self.tokens += 1;
-        if self.first_at.is_none() {
-            self.first_at = Some(now);
+        self.stopped = !self.budget.append(piece);
+        if let Some(callback) = self.on_partial.filter(|_| !self.stopped) {
+            let now = Instant::now();
+            if self
+                .last_preview
+                .is_none_or(|last| now.duration_since(last) >= PREVIEW_INTERVAL)
+            {
+                self.last_preview = Some(now);
+                callback(&self.budget.text());
+            }
         }
-        self.last_at = Some(now);
-        keep_going
+        !self.stopped
     }
 }
 
@@ -1104,8 +1233,7 @@ fn abandon_job(
         partial: JobResult {
             text: TextChunker::compose(chunks, &translated).unwrap_or_default(),
             warnings,
-            tokens: progress.tokens,
-            seconds: progress.seconds,
+            stats: progress.stats,
             degenerate: warnings > 0 && progress.translated_count == 0,
         },
     }
@@ -1116,12 +1244,19 @@ fn compose_through(chunks: &[TextChunk], translated: &[String], index: usize) ->
     TextChunker::compose(&chunks[..=index], translated).unwrap_or_default()
 }
 
-fn rate(tokens: u64, seconds: f64) -> Option<f64> {
-    if tokens > 0 && seconds > 0.0 {
-        Some(tokens as f64 / seconds)
-    } else {
-        None
-    }
+/// Report an aggregate only when every accepted response has server timings.
+fn sum_stats(
+    total: Option<GenerationStats>,
+    sample: Option<GenerationStats>,
+) -> Option<GenerationStats> {
+    let ((tokens, seconds), (more_tokens, more_seconds)) = total.zip(sample)?;
+    Some((tokens.saturating_add(more_tokens), seconds + more_seconds))
+}
+
+fn rate(stats: Option<GenerationStats>) -> Option<f64> {
+    let (tokens, seconds) = stats?;
+    let rate = tokens as f64 / seconds;
+    (rate.is_finite() && rate > 0.0).then_some(rate)
 }
 
 fn elapsed_ms(started: Instant) -> u64 {

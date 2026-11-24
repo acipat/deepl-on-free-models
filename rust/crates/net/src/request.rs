@@ -60,7 +60,7 @@ pub struct TranslationOutput {
     pub text: String,
     /// Lines that stayed in the source language.
     pub warnings: usize,
-    /// Generation rate, when the server or the chunk timing provides one.
+    /// Generation rate based on the server's token counts and decode timings.
     pub tokens_per_second: Option<f64>,
     /// Wall-clock duration of the whole job including retries.
     pub duration_ms: Option<u64>,

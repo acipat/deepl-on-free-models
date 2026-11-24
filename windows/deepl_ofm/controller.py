@@ -247,7 +247,7 @@ class AppController(QObject):
         self._file_cancel = threading.Event()
         self._write_cancel = threading.Event()
         self._booted = False
-        self._last_completed_key: tuple[str, str, str] | None = None
+        self._last_completed_key: tuple[str, str, str, str, str, str, bool] | None = None
         self._suppress_auto = False
         self._capturing_selection = False
         self._last_partial_at = 0.0
@@ -511,7 +511,11 @@ class AppController(QObject):
         target = self.target_language
         config = self.settings.snapshot()
 
-        key = (text, source.code, target.code, self.style.value, self.tone.value, config.model)
+        one_request = self.settings.translate_in_one_request
+        key = (
+            text, source.code, target.code, self.style.value, self.tone.value,
+            config.model, one_request,
+        )
         if not force and key == self._last_completed_key and self.translated_text:
             return
 
@@ -556,6 +560,7 @@ class AppController(QObject):
                 config=config,
                 fallback=fallback,
                 source_explicit=source_explicit,
+                one_request=one_request,
                 on_progress=lambda done, total: signals.progress.emit(done, total),
                 on_partial=lambda partial: signals.partial.emit(partial),
                 cancel=cancel,
@@ -564,6 +569,7 @@ class AppController(QObject):
         def done(result: TranslationOutput) -> None:
             if generation != self._generation:
                 return
+            self._last_completed_key = key
             self._finish_translation(result, text, source, target)
 
         def failed(exc: BaseException) -> None:
@@ -596,12 +602,21 @@ class AppController(QObject):
         """
         if generation != self._generation:
             return
+        if not text:
+            self._clear_translation_preview()
+            return
         now = time.monotonic()
         if now - self._last_partial_at < _PARTIAL_MIN_INTERVAL:
             return
         self._last_partial_at = now
         self.translated_text = text
         self.partialTranslationChanged.emit(text)
+
+    def _clear_translation_preview(self) -> None:
+        self._last_partial_at = 0.0
+        if self.translated_text:
+            self.translated_text = ""
+            self.translatedTextChanged.emit("")
 
     def _finish_translation(
         self, result: TranslationOutput, text: str, source: Language, target: Language
@@ -619,14 +634,6 @@ class AppController(QObject):
         if self.total:
             self.completed = self.total
             self.progressChanged.emit(self.completed, self.total)
-        self._last_completed_key = (
-            text,
-            source.code,
-            target.code,
-            self.style.value,
-            self.tone.value,
-            self.settings.snapshot().model,
-        )
         if result.warnings:
             self._emit_error(
                 t("Some paragraphs are still in the original language (%d).") % result.warnings
@@ -647,6 +654,7 @@ class AppController(QObject):
             self.historyChanged.emit()
 
     def _fail_translation(self, exc: BaseException) -> None:
+        self._clear_translation_preview()
         self.is_translating = False
         self.translatingChanged.emit(False)
         if isinstance(exc, TranslationCancelled):
@@ -669,6 +677,7 @@ class AppController(QObject):
             return
         self._cancel.set()
         self._generation += 1
+        self._clear_translation_preview()
         self.is_translating = False
         self.translatingChanged.emit(False)
         self.completed = self.total = 0
@@ -969,7 +978,7 @@ class AppController(QObject):
         self.settings.save()
         self.styleChanged.emit(self.style.value)
         self.toneChanged.emit(self.tone.value)
-        self._last_completed_key = (entry.source_text, entry.source_code, entry.target_code)
+        self._last_completed_key = None
         self.set_tab("translate")
         self.windowRequested.emit()
 

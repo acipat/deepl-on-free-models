@@ -786,6 +786,12 @@ class SettingsView(QDialog):
         )
         self.behaviour_card.add(self.debounce_row)
 
+        self.translate_in_one_request_toggle = ToggleRow(
+            t("Translate text in one request"), False, self.behaviour_card
+        )
+        self.translate_in_one_request_toggle.setObjectName("translateInOneRequestToggle")
+        self.behaviour_card.add(self.translate_in_one_request_toggle)
+
         self.keep_history_toggle = ToggleRow(
             t("Keep translation history"), False, self.behaviour_card
         )
@@ -1298,6 +1304,7 @@ class SettingsView(QDialog):
             "repetition_penalty": settings.repetition_penalty,
             "context_window": settings.context_window,
             "auto_translate": settings.auto_translate,
+            "translate_in_one_request": settings.translate_in_one_request,
             "debounce": settings.debounce,
             "keep_history": settings.keep_history,
             "warm_up_on_launch": settings.warm_up_on_launch,
@@ -1340,6 +1347,9 @@ class SettingsView(QDialog):
         self.context_field.set_value(settings.context_window)
 
         self._apply_toggle(self.auto_toggle, settings.auto_translate)
+        self._apply_toggle(
+            self.translate_in_one_request_toggle, settings.translate_in_one_request
+        )
         self._sync_debounce_visibility(settings.auto_translate)
         self.debounce_field.set_value(settings.debounce)
         self._apply_toggle(self.keep_history_toggle, settings.keep_history)
@@ -1401,6 +1411,7 @@ class SettingsView(QDialog):
         settings.context_window = int(round(self.context_field.value()))
 
         settings.auto_translate = self.auto_toggle.is_checked()
+        settings.translate_in_one_request = self.translate_in_one_request_toggle.is_checked()
         settings.debounce = self.debounce_field.value()
         settings.keep_history = self.keep_history_toggle.is_checked()
         settings.warm_up_on_launch = self.warm_up_toggle.is_checked()
@@ -1452,6 +1463,7 @@ class SettingsView(QDialog):
         settings.repetition_penalty = values["repetition_penalty"]
         settings.context_window = values["context_window"]
         settings.auto_translate = values["auto_translate"]
+        settings.translate_in_one_request = values["translate_in_one_request"]
         settings.debounce = values["debounce"]
         settings.keep_history = values["keep_history"]
         settings.warm_up_on_launch = values["warm_up_on_launch"]
@@ -2095,6 +2107,7 @@ class SettingsView(QDialog):
         self.behaviour_card.set_title(t("Behavior"))
         self.auto_toggle.set_label(t("Translate automatically while typing"))
         self.debounce_row.set_label(t("Delay"))
+        self.translate_in_one_request_toggle.set_label(t("Translate text in one request"))
         self.keep_history_toggle.set_label(t("Keep translation history"))
         self.login_toggle.set_label(t("Open at login"))
         self.login_hint.setText(

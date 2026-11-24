@@ -608,6 +608,16 @@ _merge(_MORE)
 
 
 _TAIL: dict[str, dict[str, str]] = {
+    "Translate text in one request": {
+        "uk": "Перекладати текст одним запитом",
+        "ru": "Переводить текст одним запросом",
+        "de": "Text in einer einzigen Anfrage übersetzen",
+        "fr": "Traduire le texte en une seule requête",
+        "es": "Traducir el texto en una sola solicitud",
+        "pl": "Tłumacz tekst w jednym żądaniu",
+        "pt": "Traduzir o texto num único pedido",
+        "it": "Traduci il testo in un’unica richiesta",
+    },
     "Clear history": {
         "uk": "Очистити історію",
         "ru": "Очистить историю",

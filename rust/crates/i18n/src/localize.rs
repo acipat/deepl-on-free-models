@@ -309,12 +309,12 @@ mod tests {
     }
 
     #[test]
-    fn windows_only_table_has_73_keys_per_language() {
+    fn windows_only_table_has_74_keys_per_language() {
         assert_eq!(catalog::EXTRA_TABLES.len(), TABLE_COUNT);
         for (index, table) in catalog::EXTRA_TABLES.iter().enumerate() {
             assert_eq!(
                 table.len(),
-                73,
+                74,
                 "{:?} has {} extra keys",
                 TABLE_LANGUAGES[index],
                 table.len()

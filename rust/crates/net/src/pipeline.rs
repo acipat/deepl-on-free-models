@@ -9,7 +9,10 @@ use std::sync::OnceLock;
 use fancy_regex::Regex;
 
 use ofm_i18n::Language;
-use ofm_text::OutputSanitizer;
+use ofm_text::{OutputSanitizer, TextChunker, TokenRestorer};
+
+const INLINE_CODE: &str = r"(?<!`)(`+)(?!`)(.*?)(?<!`)\1(?!`)";
+const MARKDOWN_LINK: &str = r"\[([^\]]+)\]\(([^)\s]+)\)";
 
 /// Python's `str.isalpha()`: a letter of category `L*`.
 ///
@@ -98,8 +101,8 @@ fn markdown_patterns() -> &'static [Regex] {
             r"__[^_\n]+__",                    // bold
             r"(?<![\w*])\*[^*\n]+\*(?![\w*])", // italic
             r"(?<![\w_])_[^_\n]+_(?![\w_])",   // italic
-            r"`[^`\n]+`",                      // inline code
-            r"\[[^\]]+\]\([^)\s]+\)",          // link
+            INLINE_CODE,                       // inline code
+            MARKDOWN_LINK,                     // link
         ]
         .iter()
         .filter_map(|pattern| Regex::new(pattern).ok())
@@ -256,6 +259,77 @@ pub(crate) fn validated(
         return None;
     }
     Some(cleaned)
+}
+
+/// Validate a whole-text reply before the legacy path is allowed to retry by block.
+pub(crate) fn validated_whole(raw: &str, source: &str, target: &Language) -> Option<String> {
+    if raw.contains('\u{FFFD}') {
+        return None;
+    }
+    let source = source.trim_matches('\n');
+    let candidate = OutputSanitizer::strip_preamble(raw, source);
+    let cleaned = TextChunker::normalize(&OutputSanitizer::clean(&candidate));
+    let source_lines = TextChunker::lines_with_code(source);
+    let mut reply_lines = TextChunker::lines_with_code(&cleaned);
+    let mut translated = Vec::new();
+
+    static INLINE: OnceLock<Regex> = OnceLock::new();
+    static LINKS: OnceLock<Regex> = OnceLock::new();
+    let inline = INLINE.get_or_init(|| Regex::new(INLINE_CODE).expect("valid inline code regex"));
+    let links = LINKS.get_or_init(|| Regex::new(MARKDOWN_LINK).expect("valid Markdown link regex"));
+    for (original, source_code) in source_lines {
+        let (line, reply_code) = reply_lines.next()?;
+        let original_prose = inline.replace_all(original, "");
+        if source_code || reply_code || !original_prose.chars().any(is_letter) {
+            if source_code != reply_code
+                || original.trim() != line.trim()
+                || (source_code && original != line)
+            {
+                return None;
+            }
+            translated.push(original.to_owned());
+            continue;
+        }
+        let restored = TokenRestorer::restore(original, line)?;
+        let translated_prose = inline.replace_all(&restored, "");
+        let source_structure = markdown_structure(original);
+        if source_structure != markdown_structure(&restored)
+            || (!source_structure.is_empty()
+                && TextChunker::split(original)[0].prefix
+                    != TextChunker::split(&restored)[0].prefix)
+            || markdown_patterns().iter().any(|regex| {
+                regex.find_iter(original_prose.as_ref()).count()
+                    != regex.find_iter(translated_prose.as_ref()).count()
+            })
+            || inline
+                .find_iter(original)
+                .filter_map(Result::ok)
+                .map(|m| m.as_str())
+                .ne(inline
+                    .find_iter(&restored)
+                    .filter_map(Result::ok)
+                    .map(|m| m.as_str()))
+            || links
+                .captures_iter(original_prose.as_ref())
+                .filter_map(|capture| capture.ok()?.get(2))
+                .map(|m| m.as_str())
+                .ne(links
+                    .captures_iter(translated_prose.as_ref())
+                    .filter_map(|capture| capture.ok()?.get(2))
+                    .map(|m| m.as_str()))
+        {
+            return None;
+        }
+        let original_prose = links.replace_all(&original_prose, "$1");
+        let translated_prose = links.replace_all(&translated_prose, "$1");
+        if validated(&translated_prose, &original_prose, target, false).as_deref()
+            != Some(trim_python(&translated_prose))
+        {
+            return None;
+        }
+        translated.push(restored);
+    }
+    reply_lines.next().is_none().then(|| translated.join("\n"))
 }
 
 #[cfg(test)]

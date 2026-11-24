@@ -16,12 +16,13 @@ import re
 import threading
 import time
 from dataclasses import dataclass, replace
-from typing import Callable, Iterator
+from math import isfinite
+from typing import Callable, Iterator, Literal
 from urllib.parse import urlsplit
 
 import requests
 
-from deepl_ofm.core.chunker import TextChunker
+from deepl_ofm.core.chunker import TextChunker, _closes_fence, _fence_marker, _parse_prefix
 from deepl_ofm.core.languages import AppLanguage, Language, LanguageTable
 from deepl_ofm.core.prompts import PromptBuilder, TranslationStyle, TranslationTone
 from deepl_ofm.core.providers import BackendConfig, BackendKind
@@ -35,11 +36,14 @@ _CONNECT_TIMEOUT = 10.0
 _DEFAULT_TIMEOUT = 180.0
 _WARM_UP_TIMEOUT = 180.0
 _REWRITE_MAX_BYTES = 128_000 * 4
+_MAX_OUTPUT_TOKENS = 4096
+_DOCUMENT_PREVIEW_INTERVAL = 0.120
 _STOP_SEQUENCES = [
     "hy_end",
     "<｜hy_place▁holder▁no▁8｜>",
     "<｜hy_place▁holder▁no▁2｜>",
 ]
+_STREAM_USAGE_HOSTS = frozenset({"ollama.com", "api.openai.com", "api.deepseek.com", "openrouter.ai"})
 _SHORT_BLOCK_LIMIT = 80
 #: A short block ending with one of these is a sentence, not a heading.
 _TERMINAL_PUNCTUATION = frozenset(".!?\u2026\u3002\uFF01\uFF1F")
@@ -51,6 +55,17 @@ _REWRITE_INSTRUCTION = (
     "breaks. Return only the rewritten text, without explanations or quotes."
 )
 
+_MARKDOWN_INLINE_FORMATTING = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"\*\*[^*\n]+\*\*",              # bold
+        r"__[^_\n]+__",                   # bold
+        r"(?<![\w*])\*[^*\n]+\*(?![\w*])",  # italic
+        r"(?<![\w_])_[^_\n]+_(?![\w_])",  # italic
+    )
+)
+_INLINE_CODE = re.compile(r"(?<!`)(`+)(?!`)(.*?)(?<!`)\1(?!`)")
+_MARKDOWN_LINK = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
 _MARKDOWN_PATTERNS = tuple(
     re.compile(pattern, re.MULTILINE)
     for pattern in (
@@ -58,13 +73,13 @@ _MARKDOWN_PATTERNS = tuple(
         r"^\s{0,3}[-*+]\s+\S",            # unordered list
         r"^\s{0,3}\d+[.)]\s+\S",          # ordered list
         r"^\s{0,3}>\s+\S",                # block quote
-        r"\*\*[^*\n]+\*\*",               # bold
-        r"__[^_\n]+__",                   # bold
-        r"(?<![\w*])\*[^*\n]+\*(?![\w*])",  # italic
-        r"(?<![\w_])_[^_\n]+_(?![\w_])",  # italic
-        r"`[^`\n]+`",                     # inline code
-        r"\[[^\]]+\]\([^)\s]+\)",         # link
     )
+) + _MARKDOWN_INLINE_FORMATTING + (_INLINE_CODE, _MARKDOWN_LINK)
+
+_CONTEXT_LIMIT = re.compile(
+    r"context_length_exceeded|context window|context length|context limit|"
+    r"(?:input|prompt) (?:is )?too long",
+    re.IGNORECASE,
 )
 
 
@@ -269,6 +284,47 @@ def _openai_endpoint(base: str, path: str) -> str:
     return value + "/v1/" + path
 
 
+def _generation_stats(
+    count: object, duration: object, units_per_second: int = 1
+) -> tuple[int, float] | None:
+    """Validate the pair before using a provider's generation measurements."""
+    if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+        return None
+    if not isinstance(duration, (int, float)) or isinstance(duration, bool):
+        return None
+    seconds = duration / units_per_second
+    if seconds <= 0 or not isfinite(seconds):
+        return None
+    return count, seconds
+
+
+def _openai_stats(frame: dict) -> tuple[int, float] | None:
+    usage = frame.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
+    count = usage.get("completion_tokens")
+    timings = frame.get("timings")
+    if isinstance(timings, dict):
+        stats = _generation_stats(
+            timings.get("predicted_n") or count, timings.get("predicted_ms"), 1000
+        )
+        if stats is not None:
+            return stats
+    stats = _generation_stats(count, usage.get("completion_time"))
+    if stats is not None:
+        return stats
+    time_info = frame.get("time_info")
+    if isinstance(time_info, dict):
+        stats = _generation_stats(count, time_info.get("completion_time"))
+        if stats is not None:
+            return stats
+    groq = frame.get("x_groq")
+    if isinstance(groq, dict) and isinstance(groq.get("usage"), dict):
+        usage = groq["usage"]
+        return _generation_stats(usage.get("completion_tokens"), usage.get("completion_time"))
+    return None
+
+
 def _contains_markdown(text: str) -> bool:
     """Port of ``Sources/HyMT/Support/MarkdownDetector.swift``."""
     return any(pattern.search(text) for pattern in _MARKDOWN_PATTERNS)
@@ -405,11 +461,12 @@ class Translator:
         config: BackendConfig,
         fallback: BackendConfig | None = None,
         source_explicit: bool = True,
+        one_request: bool = False,
         on_progress: Callable[[int, int], None] | None = None,
         on_partial: Callable[[str], None] | None = None,
         cancel: threading.Event | None = None,
     ) -> TranslationOutput:
-        """Translate ``text`` line by line, switching to ``fallback`` on failure."""
+        """Translate text, optionally trying one request before splitting it."""
         started = time.monotonic()
         self._raise_if_cancelled(cancel)
         if not text.strip():
@@ -424,6 +481,7 @@ class Translator:
                 tone=tone,
                 config=config,
                 source_explicit=source_explicit,
+                one_request=one_request,
                 on_progress=on_progress,
                 on_partial=on_partial,
                 cancel=cancel,
@@ -449,6 +507,7 @@ class Translator:
                 tone=tone,
                 config=fallback,
                 source_explicit=source_explicit,
+                one_request=one_request,
                 on_progress=on_progress,
                 on_partial=on_partial,
                 cancel=cancel,
@@ -653,16 +712,44 @@ class Translator:
         tone: TranslationTone,
         config: BackendConfig,
         source_explicit: bool,
+        one_request: bool,
         on_progress: Callable[[int, int], None] | None,
         on_partial: Callable[[str], None] | None,
         cancel: threading.Event | None,
     ) -> _JobResult:
-        chunks = TextChunker.split(TextChunker.normalize(text))
+        normalized = TextChunker.normalize(text)
+        chunks = TextChunker.split(normalized)
         if not chunks:
             return _JobResult(text=text, warnings=0, tokens=0, seconds=0.0)
 
         explicit_source = source if source_explicit else None
         gemma_source = _gemma_source(text, config.model, explicit_source)
+        body = normalized.strip("\n")
+        rejected_prompt = None
+        if one_request and any(
+            not chunk.is_code and any(char.isalpha() for char in chunk.text)
+            for chunk in chunks
+        ):
+            # Keep the dedicated wording and protected prefix for standalone
+            # headings and model-ID descriptions.
+            if len(chunks) != 1 or not (
+                _is_structural_heading(chunks[0].text, chunks[0].is_heading)
+                or _split_mixed_line(chunks[0].text) is not None
+            ):
+                whole, rejected_prompt = self._translate_document(
+                    body,
+                    target=target,
+                    style=style,
+                    tone=tone,
+                    config=config,
+                    source_language=explicit_source,
+                    gemma_source=gemma_source,
+                    on_progress=on_progress,
+                    on_partial=on_partial,
+                    cancel=cancel,
+                )
+                if whole is not None:
+                    return whole
         total = len(chunks)
         self._report(on_progress, 0, total)
         translated: list[str] = []
@@ -670,6 +757,7 @@ class Translator:
         translated_count = 0
         tokens = 0
         seconds = 0.0
+        stats_complete = True
 
         for index, chunk in enumerate(chunks):
             self._raise_if_cancelled(cancel)
@@ -702,6 +790,7 @@ class Translator:
                     cancel=cancel,
                     preserve_markdown=_contains_markdown(line),
                     is_heading=chunk.is_heading,
+                    rejected_prompt=rejected_prompt,
                 )
             except TranslationError as exc:
                 if exc.kind != "empty":
@@ -726,9 +815,10 @@ class Translator:
                     translatable, restored
                 )
                 warning = block.warning
+                tokens += block.tokens
+                seconds += block.seconds
+                stats_complete = stats_complete and block.tokens > 0
             translated.append(keep + translated_text)
-            tokens += block.tokens
-            seconds += block.seconds
             if warning:
                 warnings += 1
             else:
@@ -739,10 +829,151 @@ class Translator:
         return _JobResult(
             text=TextChunker.compose(chunks, translated),
             warnings=warnings,
-            tokens=tokens,
+            tokens=tokens if stats_complete else 0,
             seconds=seconds,
             degenerate=warnings > 0 and translated_count == 0,
         )
+
+    def _translate_document(
+        self,
+        text: str,
+        *,
+        target: Language,
+        style: TranslationStyle,
+        tone: TranslationTone,
+        config: BackendConfig,
+        source_language: Language | None,
+        gemma_source: Language | None,
+        on_progress: Callable[[int, int], None] | None,
+        on_partial: Callable[[str], None] | None,
+        cancel: threading.Event | None,
+    ) -> tuple[_JobResult | None, str | None]:
+        """Try the whole text once; the caller can retry in smaller pieces."""
+        if gemma_source is not None:
+            prompt = PromptBuilder.translate_gemma_prompt(text, gemma_source, target)
+        else:
+            preserve_markdown = _contains_markdown(text) or any(
+                _fence_marker(line) is not None for line in text.split("\n")
+            )
+            instruction = PromptBuilder.instruction(style, tone, target.english_name, preserve_markdown)
+            constraints = ""
+            if "\n" in text:
+                constraints += " Preserve line breaks and blank lines."
+            if preserve_markdown or "http://" in text or "https://" in text or "](" in text:
+                constraints += " Keep URLs and code unchanged."
+            if constraints:
+                instruction = instruction.removesuffix(":") + "." + constraints
+            prompt = _with_source_language(instruction + "\n\n" + text, source_language)
+
+        # Leave space for chat framing and an output that grows in translation.
+        estimated_input = (len(prompt.encode("utf-8")) + 3) // 4 + 128
+        estimated_output = 2 * ((len(text.encode("utf-8")) + 3) // 4) + 64
+        available_output = config.context_window - estimated_input
+        if estimated_output > available_output:
+            return None, None
+
+        pieces: list[str] = []
+        last_preview = 0.0
+        preview_sent = False
+
+        def preview(piece: str) -> None:
+            nonlocal last_preview, preview_sent
+            pieces.append(piece)
+            now = time.monotonic()
+            if preview_sent and now - last_preview < _DOCUMENT_PREVIEW_INTERVAL:
+                return
+            visible = self._clean_output(OutputSanitizer.strip_preamble("".join(pieces), text))
+            if visible:
+                self._emit_partial(on_partial, visible)
+                last_preview = now
+                preview_sent = True
+
+        self._report(on_progress, 0, 1)
+        accepted = False
+        try:
+            result = self._stream_chat(
+                [{"role": "user", "content": prompt}],
+                config,
+                cancel=cancel,
+                on_token=preview if on_partial is not None else None,
+                max_bytes=max(200, len(text) * 4 + 100) * 4,
+                max_tokens=min(available_output, max(_MAX_OUTPUT_TOKENS, estimated_output)),
+                detect_context_limit=True,
+            )
+            if result.exceeded_limit:
+                return None, prompt
+            cleaned = self._validate_document(text, result.text, target)
+            if cleaned is None:
+                return None, prompt
+            self._raise_if_cancelled(cancel)
+            accepted = True
+        except TranslationError as exc:
+            if exc.kind == "empty" or exc.status == 413 or (
+                exc.kind == "http" and _CONTEXT_LIMIT.search(exc.detail)
+            ):
+                return None, prompt
+            raise
+        finally:
+            if preview_sent and not accepted:
+                self._emit_partial(on_partial, "")
+        self._emit_partial(on_partial, cleaned)
+        self._report(on_progress, 1, 1)
+        return _JobResult(cleaned, 0, result.tokens, result.seconds), None
+
+    def _validate_document(self, source: str, translated: str, target: Language) -> str | None:
+        result = TextChunker.normalize(translated).strip("\n")
+        source_lines = source.split("\n")
+        result_lines = result.split("\n")
+        if len(source_lines) != len(result_lines):
+            return None
+
+        fence = None
+        restored_lines: list[str] = []
+        for before, after in zip(source_lines, result_lines):
+            if fence is not None:
+                if before != after:
+                    return None
+                if _closes_fence(before, fence):
+                    fence = None
+                restored_lines.append(before)
+                continue
+            fence = _fence_marker(before)
+            if fence is not None or _fence_marker(after) is not None:
+                if before != after:
+                    return None
+                restored_lines.append(before)
+                continue
+
+            if _INLINE_CODE.findall(before) != _INLINE_CODE.findall(after):
+                return None
+            before_prose = _INLINE_CODE.sub("", before)
+            if not any(char.isalpha() for char in before_prose):
+                if before != after:
+                    return None
+                restored_lines.append(before)
+                continue
+            restored = TokenRestorer.restore(before, after)
+            if restored is None or _INLINE_CODE.findall(before) != _INLINE_CODE.findall(restored):
+                return None
+            after_prose = _INLINE_CODE.sub("", restored)
+            if (
+                _markdown_structure(before) != _markdown_structure(restored)
+                or _parse_prefix(before)[0] != _parse_prefix(restored)[0]
+                or [destination for _, destination in _MARKDOWN_LINK.findall(before_prose)]
+                != [destination for _, destination in _MARKDOWN_LINK.findall(after_prose)]
+                or any(
+                    len(pattern.findall(before_prose)) != len(pattern.findall(after_prose))
+                    for pattern in _MARKDOWN_INLINE_FORMATTING
+                )
+            ):
+                return None
+            before_prose = _MARKDOWN_LINK.sub(r"\1", before_prose)
+            after_prose = _MARKDOWN_LINK.sub(r"\1", after_prose)
+            clean = self._validated(after_prose, before_prose, target)
+            if clean is None or clean != after_prose.strip():
+                return None
+            restored_lines.append(restored)
+        return "\n".join(restored_lines)
 
     def _translate_chunk(
         self,
@@ -757,6 +988,7 @@ class Translator:
         cancel: threading.Event | None,
         preserve_markdown: bool,
         is_heading: bool = False,
+        rejected_prompt: str | None = None,
     ) -> _BlockResult:
         """Choose the prompt ladder for one line and translate it."""
         body = text.strip()
@@ -796,6 +1028,11 @@ class Translator:
                 prompts = [styled, plain_fallback, literal]
             else:
                 prompts = [styled, natural, plain_fallback]
+        if rejected_prompt is not None:
+            prompts = [
+                prompt for prompt in prompts
+                if _with_source_language(prompt, source_language) != rejected_prompt
+            ]
         return self._buffered_translation(
             prompts,
             body,
@@ -900,6 +1137,7 @@ class Translator:
         failures = 0
         tokens = 0
         seconds = 0.0
+        stats_complete = True
         for piece in pieces:
             self._raise_if_cancelled(cancel)
             if gemma_source is not None:
@@ -937,6 +1175,7 @@ class Translator:
                     success = clean
                     tokens += raw.tokens
                     seconds += raw.seconds
+                    stats_complete = stats_complete and raw.tokens > 0
                     break
             if success is None:
                 translated.append(piece)
@@ -946,7 +1185,9 @@ class Translator:
 
         if failures >= len(pieces):
             return None
-        return _BlockResult(" ".join(translated), failures > 0, tokens, seconds)
+        return _BlockResult(
+            " ".join(translated), failures > 0, tokens if stats_complete else 0, seconds
+        )
 
     # -------------------------------------------------------------- streaming
 
@@ -992,6 +1233,8 @@ class Translator:
         cancel: threading.Event | None,
         on_token: Callable[[str], None] | None,
         max_bytes: int,
+        max_tokens: int = _MAX_OUTPUT_TOKENS,
+        detect_context_limit: bool = False,
     ) -> _ChatResult:
         if not config.model:
             raise TranslationError("model", detail="")
@@ -1002,46 +1245,41 @@ class Translator:
         base = config.compatible_base()
         if config.kind == BackendKind.OLLAMA:
             url = _ollama_endpoint(base)
-            body = self._ollama_body(messages, config)
+            body = self._ollama_body(messages, config, max_tokens)
             protocol = "ollama"
         else:
             url = _openai_endpoint(base, "chat/completions")
-            body = self._openai_body(messages, config)
+            body = self._openai_body(messages, config, max_tokens)
             protocol = "openai"
         self._validate_url(url, base)
+        stream_options = body.get("stream_options")
+        wait_for_usage = (
+            isinstance(stream_options, dict) and stream_options.get("include_usage") is True
+        )
 
         response = self._post(url, body, config, base)
         done = threading.Event()
         budget = _OutputBudget(max_bytes)
-        tokens = 0
-        first_at: float | None = None
-        last_at: float | None = None
-        started = time.monotonic()
-        server_tokens: int | None = None
-        server_seconds: float | None = None
+        finished = False
+        server_stats: tuple[int, float] | None = None
 
         def emit(piece: str) -> bool:
-            nonlocal tokens, first_at, last_at
-            now = time.monotonic()
+            if finished:
+                return True
             keep_going = budget.append(piece)
-            tokens += 1
-            if first_at is None:
-                first_at = now
-            last_at = now
             if keep_going and on_token is not None:
                 on_token(piece)
             return keep_going
 
         try:
-            self._check_status(response, config)
             if cancel is not None:
                 threading.Thread(
                     target=_watch_cancel,
                     args=(cancel, response, done),
                     daemon=True,
                 ).start()
+            self._check_status(response, config, detect_context_limit=detect_context_limit)
 
-            finished = False
             for line in self._decoded_lines(response, cancel):
                 if cancel is not None and cancel.is_set():
                     raise TranslationCancelled()
@@ -1050,9 +1288,20 @@ class Translator:
                 if protocol == "ollama":
                     terminal, stats = self._consume_ollama(line, emit)
                 else:
-                    terminal, stats = self._consume_openai(line, emit)
+                    phase, stats = self._consume_openai(line, emit)
+                    # Only servers asked for usage are expected to send a trailer.
+                    finished = finished or phase == "stop"
+                    terminal = phase == "done" or (
+                        finished
+                        and (
+                            not wait_for_usage
+                            or phase == "usage"
+                            or stats is not None
+                            or server_stats is not None
+                        )
+                    )
                 if stats is not None:
-                    server_tokens, server_seconds = stats
+                    server_stats = stats
                 if terminal:
                     finished = True
                     break
@@ -1067,25 +1316,10 @@ class Translator:
             done.set()
             self._close(response)
 
-        elapsed = time.monotonic() - started
-        span = (last_at - first_at) if first_at is not None and last_at is not None else 0.0
-        if server_seconds and server_seconds > 0:
-            generation_seconds = server_seconds
-        elif span > 0:
-            generation_seconds = span
-        elif tokens:
-            # Instant fake/real streams still get a measurable rate; the floor
-            # only avoids a division by zero.
-            generation_seconds = max(elapsed, 0.001)
-        else:
-            generation_seconds = 0.0
-        total_tokens = server_tokens or tokens
-        rate = (
-            total_tokens / generation_seconds if total_tokens and generation_seconds > 0 else None
-        )
+        total_tokens, generation_seconds = server_stats or (0, 0.0)
         return _ChatResult(
             text=budget.text,
-            tokens_per_second=rate,
+            tokens_per_second=self._rate(total_tokens, generation_seconds),
             tokens=total_tokens,
             seconds=generation_seconds,
             exceeded_limit=budget.exceeded_limit,
@@ -1108,35 +1342,31 @@ class Translator:
             content = message.get("content")
             if isinstance(content, str) and content and not emit(content):
                 return True, None
-        stats: tuple[int, float] | None = None
         if obj.get("done") is True:
-            count = obj.get("eval_count")
-            duration = obj.get("eval_duration")
-            if isinstance(count, int) and count > 0 and isinstance(duration, (int, float)):
-                if duration > 0:
-                    stats = (count, float(duration) / 1_000_000_000)
             if obj.get("done_reason") == "length":
                 raise TranslationError("empty", detail="length")
-            return True, stats
-        return False, stats
+            return True, _generation_stats(
+                obj.get("eval_count"), obj.get("eval_duration"), 1_000_000_000
+            )
+        return False, None
 
     def _consume_openai(
         self, line: str, emit: Callable[[str], bool]
-    ) -> tuple[bool, tuple[int, float] | None]:
+    ) -> tuple[Literal["more", "stop", "usage", "done"], tuple[int, float] | None]:
         stripped = line.strip()
         if not stripped.startswith("data:"):
-            return False, None
+            return "more", None
         payload = stripped[5:].strip()
         if payload == "[DONE]":
-            return True, None
+            return "done", None
         if not payload:
-            return False, None
+            return "more", None
         try:
             obj = json.loads(payload)
         except (ValueError, TypeError):
-            return False, None
+            return "more", None
         if not isinstance(obj, dict):
-            return False, None
+            return "more", None
 
         error = obj.get("error")
         if isinstance(error, dict):
@@ -1145,7 +1375,9 @@ class Translator:
         if isinstance(error, str) and error:
             raise TranslationError("http", detail=error)
 
-        stats: tuple[int, float] | None = None
+        stats = _openai_stats(obj)
+        usage = obj.get("usage")
+        has_usage = isinstance(usage, dict) and bool(usage)
         choices = obj.get("choices")
         if isinstance(choices, list) and choices:
             first = choices[0]
@@ -1156,19 +1388,21 @@ class Translator:
                 if isinstance(delta, dict):
                     content = delta.get("content")
                     if isinstance(content, str) and content and not emit(content):
-                        return True, stats
+                        return "done", stats
                 reason = first.get("finish_reason")
                 if isinstance(reason, str) and reason:
                     if reason == "length":
                         raise TranslationError("empty", detail="length")
                     if reason in ("stop", "end_turn"):
-                        return True, stats
+                        return ("done" if has_usage else "stop"), stats
                     raise TranslationError("interrupted", detail=reason)
-        return False, stats
+        if has_usage and not choices:
+            return "usage", stats
+        return "more", stats
 
     # ---------------------------------------------------------------- helpers
 
-    def _ollama_body(self, messages: list[dict], config: BackendConfig) -> dict:
+    def _ollama_body(self, messages: list[dict], config: BackendConfig, max_tokens: int) -> dict:
         return {
             "model": config.model,
             "messages": messages,
@@ -1180,21 +1414,25 @@ class Translator:
                 "top_k": config.top_k,
                 "repeat_penalty": config.repetition_penalty,
                 "num_ctx": config.context_window,
-                "num_predict": 4096,
+                "num_predict": max_tokens,
                 "stop": list(_STOP_SEQUENCES),
             },
         }
 
-    def _openai_body(self, messages: list[dict], config: BackendConfig) -> dict:
-        return {
+    def _openai_body(self, messages: list[dict], config: BackendConfig, max_tokens: int) -> dict:
+        body: dict[str, object] = {
             "model": config.model,
             "messages": messages,
             "stream": True,
             "temperature": config.temperature,
             "top_p": config.top_p,
-            "max_tokens": 4096,
+            "max_tokens": max_tokens,
             "stop": list(_STOP_SEQUENCES),
         }
+        endpoint = urlsplit(config.compatible_base())
+        if endpoint.scheme == "https" and endpoint.hostname in _STREAM_USAGE_HOSTS:
+            body["stream_options"] = {"include_usage": True}
+        return body
 
     def _headers(self, config: BackendConfig) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -1244,7 +1482,13 @@ class Translator:
                 raise TranslationCancelled() from None
             raise TranslationError("interrupted", detail=str(exc) or type(exc).__name__) from exc
 
-    def _check_status(self, response: object, config: BackendConfig) -> None:
+    def _check_status(
+        self,
+        response: requests.Response,
+        config: BackendConfig,
+        *,
+        detect_context_limit: bool = False,
+    ) -> None:
         status = int(getattr(response, "status_code", 0))
         if 200 <= status < 300:
             return
@@ -1254,6 +1498,14 @@ class Translator:
             detail = str(headers.get("Retry-After", "") or "")
         elif status == 404:
             detail = config.model
+        elif detect_context_limit and status in (400, 422):
+            try:
+                payload = next(response.iter_content(chunk_size=4096), b"")
+            except requests.exceptions.RequestException:
+                pass  # Keep the original HTTP error if its body cannot be read.
+            else:
+                if _CONTEXT_LIMIT.search(payload.decode("utf-8", errors="replace")):
+                    detail = "context limit"
         raise _http_error(status, detail)
 
     def _validate_url(self, url: str, base: str) -> None:
