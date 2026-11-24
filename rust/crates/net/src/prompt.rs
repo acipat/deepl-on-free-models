@@ -6,11 +6,15 @@
 //! by its model card. Keeping that decision in one place means `ofm prompt`
 //! shows exactly what the engine will send.
 
-use ofm_config::PromptFamily;
+use ofm_config::{BackendConfig, PromptFamily};
 use ofm_i18n::Language;
 use ofm_text::{PromptBuilder, TextChunker, TranslationStyle, TranslationTone};
 
-use crate::pipeline::{contains_markdown, is_letter, split_mixed_line, with_source_language};
+use crate::pipeline::{
+    contains_markdown, is_letter, markdown_table_lines, split_mixed_line, translation_chunks,
+    with_source_language,
+};
+use crate::wire::MAX_OUTPUT_TOKENS;
 
 /// One block and the settings that choose its prompt ladder.
 #[derive(Clone, Copy, Debug)]
@@ -106,6 +110,123 @@ impl PromptPlan<'_> {
     }
 }
 
+/// The exact first prompt for text mode, including its normal size fallback.
+#[allow(clippy::too_many_arguments)]
+pub fn first_prompt_for_input(
+    text: &str,
+    source: &Language,
+    source_explicit: bool,
+    target: &Language,
+    style: TranslationStyle,
+    tone: TranslationTone,
+    config: &BackendConfig,
+    one_request: bool,
+) -> Option<String> {
+    if one_request {
+        let normalized = TextChunker::normalize(text);
+        if let Some((prompt, _)) = whole_text_prompt(
+            &normalized,
+            source,
+            source_explicit,
+            target,
+            style,
+            tone,
+            config,
+        ) {
+            return Some(prompt);
+        }
+    }
+    first_prompt_for_text(
+        text,
+        source,
+        source_explicit,
+        target,
+        style,
+        tone,
+        &config.model,
+    )
+}
+
+pub(crate) fn whole_text_prompt(
+    text: &str,
+    source: &Language,
+    source_explicit: bool,
+    target: &Language,
+    style: TranslationStyle,
+    tone: TranslationTone,
+    config: &BackendConfig,
+) -> Option<(String, u32)> {
+    let body = text.trim_matches('\n');
+    // Leave room for expansion in translation and for chat-template tokens.
+    let output_tokens = body.len().div_ceil(4).saturating_mul(2).saturating_add(64);
+    let context = config.context_window as usize;
+    if output_tokens + body.len().div_ceil(4) + 128 > context {
+        return None;
+    }
+    let mut has_prose = false;
+    let mut has_code = false;
+    for (line, code) in TextChunker::lines_with_code(body) {
+        has_code |= code;
+        has_prose |= !code && line.chars().any(is_letter);
+    }
+    if !has_prose {
+        return None;
+    }
+
+    let multiline = body.contains('\n');
+    let mut is_heading = false;
+    if !multiline && body.chars().count() <= TextChunker::LINE_LIMIT {
+        let chunks = TextChunker::split(body);
+        let chunk = &chunks[0];
+        if (chunk.is_heading && !chunk.prefix.is_empty()) || split_mixed_line(body).is_some() {
+            // These inputs already use a single request and restore the prefix locally.
+            return None;
+        }
+        is_heading = chunk.is_heading;
+    }
+    let has_table = !markdown_table_lines(body).is_empty();
+    let markdown = contains_markdown(body) || has_code || has_table;
+    let plan = PromptPlan {
+        text: body,
+        target,
+        source,
+        source_explicit,
+        style,
+        tone,
+        family: PromptFamily::for_model(&config.model),
+        is_heading,
+        preserve_markdown: markdown,
+    };
+    let prompt = if let Some(gemma) = plan.gemma_prompt(body) {
+        gemma
+    } else if is_heading && !markdown {
+        plan.first_prompt()
+    } else {
+        let mut instruction =
+            PromptBuilder::instruction(style, tone, target.english_name, markdown);
+        let has_url = body.contains("http://") || body.contains("https://") || body.contains("](");
+        if multiline || markdown || has_url {
+            instruction.pop();
+            instruction.push('.');
+            if multiline {
+                instruction.push_str(" Preserve line breaks and blank lines.");
+            }
+            if has_table {
+                instruction.push_str(" Keep table structure, URLs and code unchanged.");
+            } else if markdown || has_url {
+                instruction.push_str(" Keep URLs and code unchanged.");
+            }
+        }
+        with_source_language(format!("{instruction}\n\n{body}"), plan.source_hint())
+    };
+    let available = context.checked_sub(prompt.len().div_ceil(4) + 128)?;
+    if output_tokens > available {
+        return None;
+    }
+    let output_limit = available.min(output_tokens.max(MAX_OUTPUT_TOKENS as usize));
+    Some((prompt, u32::try_from(output_limit).ok()?))
+}
+
 /// The exact first prompt a translation of `text` would send, if any block is
 /// translatable.
 ///
@@ -123,12 +244,16 @@ pub fn first_prompt_for_text(
     model: &str,
 ) -> Option<String> {
     let normalized = TextChunker::normalize(text);
-    let chunks = TextChunker::split(&normalized);
+    let (chunks, table_chunks) = translation_chunks(&normalized);
     let family = PromptFamily::for_model(model);
-    for chunk in &chunks {
+    for (index, chunk) in chunks.iter().enumerate() {
         let body = &chunk.text;
         let line = format!("{}{}", chunk.prefix, body);
-        if chunk.is_code || !body.chars().any(is_letter) {
+        let is_table = table_chunks.binary_search(&index).is_ok();
+        if chunk.is_code
+            || !body.chars().any(is_letter)
+            || (is_table && line.chars().count() > TextChunker::LINE_LIMIT)
+        {
             continue;
         }
         let translatable = match split_mixed_line(body) {
@@ -143,8 +268,8 @@ pub fn first_prompt_for_text(
             style,
             tone,
             family,
-            is_heading: chunk.is_heading,
-            preserve_markdown: contains_markdown(&line),
+            is_heading: chunk.is_heading && !is_table,
+            preserve_markdown: contains_markdown(&line) || is_table,
         };
         return Some(plan.first_prompt());
     }

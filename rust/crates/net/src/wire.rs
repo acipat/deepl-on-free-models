@@ -21,6 +21,8 @@ pub(crate) const STOP_SEQUENCES: [&str; 3] = [
     "<\u{FF5C}hy_place\u{2581}holder\u{2581}no\u{2581}2\u{FF5C}>",
 ];
 
+pub(crate) const MAX_OUTPUT_TOKENS: u32 = 4096;
+
 /// Which streaming protocol a response uses.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Protocol {
@@ -60,16 +62,46 @@ pub(crate) struct OllamaBody<'a> {
     options: OllamaOptions,
 }
 
+impl OllamaBody<'_> {
+    pub(crate) fn with_output_limit(mut self, output_limit: Option<u32>) -> Self {
+        if let Some(limit) = output_limit {
+            self.options.num_predict = limit;
+        }
+        self
+    }
+}
+
 /// `POST /chat/completions` body for a streaming translation.
 #[derive(Serialize)]
 pub(crate) struct OpenAiBody<'a> {
     model: &'a str,
     messages: [Message<'a>; 1],
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
     temperature: f32,
     top_p: f32,
     max_tokens: u32,
     stop: &'static [&'static str],
+}
+
+#[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
+}
+
+impl OpenAiBody<'_> {
+    pub(crate) fn with_output_limit(mut self, output_limit: Option<u32>) -> Self {
+        if let Some(limit) = output_limit {
+            self.max_tokens = limit;
+        }
+        self
+    }
+
+    /// Whether the server was asked to send a final usage frame.
+    pub(crate) fn requests_usage(&self) -> bool {
+        self.stream_options.is_some()
+    }
 }
 
 /// `POST /api/chat` body used to warm a local model up.
@@ -143,7 +175,7 @@ pub(crate) fn ollama_body<'a>(prompt: &'a str, config: &'a BackendConfig) -> Oll
             top_k: config.top_k,
             repeat_penalty: config.repetition_penalty,
             num_ctx: config.context_window,
-            num_predict: 4096,
+            num_predict: MAX_OUTPUT_TOKENS,
             stop: &STOP_SEQUENCES,
         },
     }
@@ -151,6 +183,13 @@ pub(crate) fn ollama_body<'a>(prompt: &'a str, config: &'a BackendConfig) -> Oll
 
 /// Streaming translation body for an OpenAI-compatible server.
 pub(crate) fn openai_body<'a>(prompt: &'a str, config: &'a BackendConfig) -> OpenAiBody<'a> {
+    let include_usage = reqwest::Url::parse(&config.base_url).is_ok_and(|url| {
+        url.scheme() == "https"
+            && matches!(
+                url.host_str(),
+                Some("ollama.com" | "api.openai.com" | "api.deepseek.com" | "openrouter.ai")
+            )
+    });
     OpenAiBody {
         model: &config.model,
         messages: [Message {
@@ -158,9 +197,12 @@ pub(crate) fn openai_body<'a>(prompt: &'a str, config: &'a BackendConfig) -> Ope
             content: prompt,
         }],
         stream: true,
+        stream_options: include_usage.then_some(StreamOptions {
+            include_usage: true,
+        }),
         temperature: config.temperature,
         top_p: config.top_p,
-        max_tokens: 4096,
+        max_tokens: MAX_OUTPUT_TOKENS,
         stop: &STOP_SEQUENCES,
     }
 }
@@ -234,8 +276,17 @@ pub(crate) fn bearer(key: &str, base: &str) -> Result<HeaderValue, TranslationEr
         .map_err(|_| TranslationError::new(ErrorKind::Connection).with_detail(base))
 }
 
+/// Server-reported output tokens and seconds spent generating them.
+pub(crate) type GenerationStats = (u64, f64);
+
 /// Result of feeding one protocol frame to the accumulator.
-pub(crate) type FrameOutcome = (bool, Option<(u64, f64)>);
+pub(crate) type FrameOutcome = (bool, Option<GenerationStats>);
+
+fn generation_stats(tokens: Option<u64>, seconds: Option<f64>) -> Option<GenerationStats> {
+    let tokens = tokens.filter(|count| *count > 0)?;
+    let seconds = seconds.filter(|duration| duration.is_finite() && *duration > 0.0)?;
+    Some((tokens, seconds))
+}
 
 /// An error carried inside a protocol frame (`{"error": …}`).
 pub(crate) fn frame_error(detail: &str) -> TranslationError {
@@ -277,22 +328,67 @@ pub(crate) fn consume_ollama(
         }
     }
 
-    let mut stats = None;
     if object.get("done").and_then(Value::as_bool) == Some(true) {
-        if let (Some(count), Some(duration)) = (
+        let stats = generation_stats(
             object.get("eval_count").and_then(Value::as_u64),
-            object.get("eval_duration").and_then(Value::as_f64),
-        ) {
-            if count > 0 && duration > 0.0 {
-                stats = Some((count, duration / 1_000_000_000.0));
-            }
-        }
+            object
+                .get("eval_duration")
+                .and_then(Value::as_f64)
+                .map(|ns| ns / 1_000_000_000.0),
+        );
         if object.get("done_reason").and_then(Value::as_str) == Some("length") {
             return Err(TranslationError::new(ErrorKind::Empty).with_detail("length"));
         }
         return Ok((true, stats));
     }
-    Ok((false, stats))
+    Ok((false, None))
+}
+
+fn openai_payload(line: &str) -> Option<&str> {
+    line.trim().strip_prefix("data:").map(str::trim)
+}
+
+/// The stream can close after the final usage data or the SSE end marker.
+pub(crate) fn openai_trailer(line: &str) -> bool {
+    let Some(payload) = openai_payload(line) else {
+        return false;
+    };
+    payload == "[DONE]"
+        || serde_json::from_str::<Value>(payload).is_ok_and(|frame| {
+            frame["usage"]
+                .as_object()
+                .is_some_and(|usage| !usage.is_empty())
+        })
+}
+
+fn openai_stats(frame: &Value) -> Option<GenerationStats> {
+    let usage = &frame["usage"];
+    let timings = &frame["timings"];
+    let completion_tokens = usage["completion_tokens"].as_u64();
+    generation_stats(
+        timings["predicted_n"]
+            .as_u64()
+            .filter(|count| *count > 0)
+            .or(completion_tokens),
+        timings["predicted_ms"]
+            .as_f64()
+            .map(|milliseconds| milliseconds / 1000.0),
+    )
+    .or_else(|| {
+        let groq_usage = &frame["x_groq"]["usage"];
+        generation_stats(
+            groq_usage["completion_tokens"].as_u64(),
+            groq_usage["completion_time"].as_f64(),
+        )
+    })
+    .or_else(|| {
+        generation_stats(
+            completion_tokens,
+            usage["completion_time"]
+                .as_f64()
+                .or_else(|| frame["time_info"]["completion_time"].as_f64()),
+        )
+    })
 }
 
 /// Decode one OpenAI-compatible SSE line.
@@ -304,11 +400,9 @@ pub(crate) fn consume_openai(
     line: &str,
     emit: &mut dyn FnMut(&str) -> bool,
 ) -> Result<FrameOutcome, TranslationError> {
-    let stripped = line.trim();
-    let Some(payload) = stripped.strip_prefix("data:") else {
+    let Some(payload) = openai_payload(line) else {
         return Ok((false, None));
     };
-    let payload = payload.trim();
     if payload == "[DONE]" {
         return Ok((true, None));
     }
@@ -335,9 +429,8 @@ pub(crate) fn consume_openai(
         _ => {}
     }
 
-    if let Some(first) = object
-        .get("choices")
-        .and_then(Value::as_array)
+    let choices = object.get("choices").and_then(Value::as_array);
+    if let Some(first) = choices
         .and_then(|choices| choices.first())
         .and_then(Value::as_object)
     {
@@ -361,12 +454,17 @@ pub(crate) fn consume_openai(
         {
             return match reason {
                 "length" => Err(TranslationError::new(ErrorKind::Empty).with_detail("length")),
-                "stop" | "end_turn" => Ok((true, None)),
+                "stop" | "end_turn" => Ok((true, openai_stats(&value))),
                 other => Err(TranslationError::new(ErrorKind::Interrupted).with_detail(other)),
             };
         }
     }
-    Ok((false, None))
+    let stats = if choices.is_some_and(Vec::is_empty) {
+        openai_stats(&value)
+    } else {
+        None
+    };
+    Ok((false, stats))
 }
 
 #[cfg(test)]

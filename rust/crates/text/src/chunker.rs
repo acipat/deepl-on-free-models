@@ -106,6 +106,22 @@ impl TextChunker {
         text.replace("\r\n", "\n").replace('\r', "\n")
     }
 
+    /// Iterate over normalised lines and mark fenced code, including the fences.
+    pub fn lines_with_code(text: &str) -> impl Iterator<Item = (&str, bool)> {
+        let mut open = None;
+        text.split('\n').map(move |line| {
+            if let Some(marker) = open {
+                if closes_fence(line, marker) {
+                    open = None;
+                }
+                (line, true)
+            } else {
+                open = fence_marker(line);
+                (line, open.is_some())
+            }
+        })
+    }
+
     /// Split `text` into one chunk per non-empty line.
     ///
     /// Leading and trailing blank lines are dropped (Swift behaviour); the
@@ -113,6 +129,11 @@ impl TextChunker {
     /// [`TextChunk::separator_before`]. A fenced code block becomes a single
     /// chunk with [`TextChunk::is_code`] set so it is never sentence-split.
     pub fn split(text: &str) -> Vec<TextChunk> {
+        Self::split_preserving(text, |_| false)
+    }
+
+    /// Split text while leaving selected zero-based source lines indivisible.
+    pub fn split_preserving(text: &str, keep_line: impl Fn(usize) -> bool) -> Vec<TextChunk> {
         let normalized = Self::normalize(text);
         let lines: Vec<&str> = normalized.split('\n').collect();
         let mut chunks: Vec<TextChunk> = Vec::new();
@@ -161,7 +182,7 @@ impl TextChunker {
             }
 
             let trimmed = line.trim_end();
-            if trimmed.chars().count() <= Self::LINE_LIMIT {
+            if keep_line(position) || trimmed.chars().count() <= Self::LINE_LIMIT {
                 let (prefix, body, is_heading) = parse_prefix(trimmed);
                 chunks.push(TextChunk {
                     prefix,

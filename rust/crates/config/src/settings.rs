@@ -90,6 +90,8 @@ pub struct AppSettings {
     pub context_window: u32,
     /// Translate while typing.
     pub auto_translate: bool,
+    /// Translate the text pane in one request before retrying by block.
+    pub translate_in_one_request: bool,
     /// Delay between the last keystroke and an automatic translation.
     pub debounce: f64,
     /// Global shortcut that translates the clipboard.
@@ -145,6 +147,7 @@ impl Default for AppSettings {
             repetition_penalty: 1.05,
             context_window: 8192,
             auto_translate: true,
+            translate_in_one_request: true,
             debounce: 0.45,
             hot_key: KeyCombo::standard(),
             selection_hot_key: KeyCombo::selection(),
@@ -428,6 +431,10 @@ impl AppSettings {
             "auto_translate".to_string(),
             Value::Bool(self.auto_translate),
         );
+        object.insert(
+            "translate_in_one_request".to_string(),
+            Value::Bool(self.translate_in_one_request),
+        );
         object.insert("debounce".to_string(), number_f64(self.debounce));
         object.insert("hot_key".to_string(), self.hot_key.to_json());
         object.insert(
@@ -554,6 +561,7 @@ impl AppSettings {
         settings.repetition_penalty = float_value(flat.get("repetition_penalty"), 1.05) as f32;
         settings.context_window = u32_value(flat.get("context_window"), 8192);
         settings.auto_translate = bool_value(flat.get("auto_translate"), true);
+        settings.translate_in_one_request = bool_value(flat.get("translate_in_one_request"), true);
         settings.debounce = float_value(flat.get("debounce"), 0.45);
         settings.hot_key = combo_value(flat.get("hot_key"), &KeyCombo::standard());
         settings.selection_hot_key =
@@ -719,6 +727,7 @@ fn canonical_key(key: &str) -> &str {
         "repetitionPenalty" => "repetition_penalty",
         "contextWindow" => "context_window",
         "autoTranslate" => "auto_translate",
+        "translateInOneRequest" => "translate_in_one_request",
         "hotKey" => "hot_key",
         "selectionHotKey" => "selection_hot_key",
         "showInMenuBar" => "show_in_menu_bar",

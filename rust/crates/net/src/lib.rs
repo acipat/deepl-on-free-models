@@ -67,7 +67,7 @@ mod wire;
 
 pub use crate::error::{ErrorKind, TranslationError};
 pub use crate::probe::model_listed;
-pub use crate::prompt::{first_prompt_for_text, PromptPlan};
+pub use crate::prompt::{first_prompt_for_input, first_prompt_for_text, PromptPlan};
 pub use crate::request::{CancelFlag, PartialFn, ProgressFn, TranslateRequest, TranslationOutput};
 pub use crate::translator::Translator;
 pub use ofm_config::PromptFamily;

@@ -302,7 +302,7 @@ async fn translate(args: TextArgs) -> Result<(), String> {
     };
 
     let output = translator
-        .translate(request)
+        .translate_text(request, settings.translate_in_one_request)
         .await
         .map_err(|error| error.message())?;
 
@@ -451,14 +451,15 @@ fn prompt(args: TextArgs) -> Result<(), String> {
 
     // Use the translator's own selection, so the preview is exactly the first
     // request body instead of a separately built instruction.
-    let prompt = ofm_net::first_prompt_for_text(
+    let prompt = ofm_net::first_prompt_for_input(
         &text,
         &source,
         source_explicit,
         target,
         style_from(&args.style),
         tone_from(&args.tone),
-        &config.model,
+        &config,
+        settings.translate_in_one_request,
     )
     .ok_or_else(|| "nothing to translate".to_string())?;
     println!("{prompt}");

@@ -9,7 +9,7 @@
 //! * [`TABLES`] holds the macOS catalogue from
 //!   `Sources/HyMT/Support/Localization.swift` (305 keys per language).
 //! * [`EXTRA_TABLES`] holds the Windows-only strings from
-//!   `windows/deepl_ofm/i18n/extra.py` (73 keys per language).
+//!   `windows/deepl_ofm/i18n/extra.py` (74 keys per language).
 //!
 //! Both arrays are indexed in this order: uk, ru, de, fr, es, pl, pt, it.
 //! Every table is sorted by its English key, which keeps this file stable
@@ -2556,6 +2556,7 @@ pub(crate) static EXTRA_UKRAINIAN: &[(&str, &str)] = &[
     ("The app is still running in the tray.", "Застосунок і далі працює в треї."),
     ("The clipboard is empty.", "Буфер обміну порожній."),
     ("Translate", "Перекласти"),
+    ("Translate text in one request", "Перекладати текст одним запитом"),
     ("Translation cancelled.", "Переклад скасовано."),
     ("Translation copied", "Переклад скопійовано"),
     ("Tray icon", "Значок у треї"),
@@ -2634,6 +2635,7 @@ pub(crate) static EXTRA_RUSSIAN: &[(&str, &str)] = &[
     ("The app is still running in the tray.", "Приложение продолжает работать в трее."),
     ("The clipboard is empty.", "Буфер обмена пуст."),
     ("Translate", "Перевести"),
+    ("Translate text in one request", "Переводить текст одним запросом"),
     ("Translation cancelled.", "Перевод отменён."),
     ("Translation copied", "Перевод скопирован"),
     ("Tray icon", "Значок в трее"),
@@ -2712,6 +2714,7 @@ pub(crate) static EXTRA_GERMAN: &[(&str, &str)] = &[
     ("The app is still running in the tray.", "Die App läuft weiter im Infobereich."),
     ("The clipboard is empty.", "Die Zwischenablage ist leer."),
     ("Translate", "Übersetzen"),
+    ("Translate text in one request", "Text in einer einzigen Anfrage übersetzen"),
     ("Translation cancelled.", "Übersetzung abgebrochen."),
     ("Translation copied", "Übersetzung kopiert"),
     ("Tray icon", "Infobereich-Symbol"),
@@ -2790,6 +2793,7 @@ pub(crate) static EXTRA_FRENCH: &[(&str, &str)] = &[
     ("The app is still running in the tray.", "L’application reste active dans la zone de notification."),
     ("The clipboard is empty.", "Le presse-papiers est vide."),
     ("Translate", "Traduire"),
+    ("Translate text in one request", "Traduire le texte en une seule requête"),
     ("Translation cancelled.", "Traduction annulée."),
     ("Translation copied", "Traduction copiée"),
     ("Tray icon", "Icône de la zone de notification"),
@@ -2868,6 +2872,7 @@ pub(crate) static EXTRA_SPANISH: &[(&str, &str)] = &[
     ("The app is still running in the tray.", "La aplicación sigue activa en la bandeja del sistema."),
     ("The clipboard is empty.", "El portapapeles está vacío."),
     ("Translate", "Traducir"),
+    ("Translate text in one request", "Traducir el texto en una sola solicitud"),
     ("Translation cancelled.", "Traducción cancelada."),
     ("Translation copied", "Traducción copiada"),
     ("Tray icon", "Icono de la bandeja"),
@@ -2946,6 +2951,7 @@ pub(crate) static EXTRA_POLISH: &[(&str, &str)] = &[
     ("The app is still running in the tray.", "Aplikacja nadal działa w zasobniku."),
     ("The clipboard is empty.", "Schowek jest pusty."),
     ("Translate", "Przetłumacz"),
+    ("Translate text in one request", "Tłumacz tekst w jednym żądaniu"),
     ("Translation cancelled.", "Tłumaczenie anulowane."),
     ("Translation copied", "Skopiowano tłumaczenie"),
     ("Tray icon", "Ikona w zasobniku"),
@@ -3024,6 +3030,7 @@ pub(crate) static EXTRA_PORTUGUESE: &[(&str, &str)] = &[
     ("The app is still running in the tray.", "A aplicação continua a ser executada na área de notificação."),
     ("The clipboard is empty.", "A área de transferência está vazia."),
     ("Translate", "Traduzir"),
+    ("Translate text in one request", "Traduzir o texto num único pedido"),
     ("Translation cancelled.", "Tradução cancelada."),
     ("Translation copied", "Tradução copiada"),
     ("Tray icon", "Ícone da área de notificação"),
@@ -3102,6 +3109,7 @@ pub(crate) static EXTRA_ITALIAN: &[(&str, &str)] = &[
     ("The app is still running in the tray.", "L’app continua in esecuzione nella barra delle applicazioni."),
     ("The clipboard is empty.", "Gli appunti sono vuoti."),
     ("Translate", "Traduci"),
+    ("Translate text in one request", "Traduci il testo in un’unica richiesta"),
     ("Translation cancelled.", "Traduzione annullata."),
     ("Translation copied", "Traduzione copiata"),
     ("Tray icon", "Icona nell’area di notifica"),

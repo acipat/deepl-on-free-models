@@ -437,6 +437,7 @@
       repetitionPenalty: 1.05,
       contextWindow: 8192,
       autoTranslate: true,
+      translateInOneRequest: true,
       debounce: 0.45,
       hotKey: { key: "t", ctrl: true, alt: true, shift: false, meta: false },
       selectionHotKey: { key: "c", ctrl: true, alt: true, shift: false, meta: false },
@@ -494,6 +495,10 @@
       autoTranslate: asBool(
         pick(raw, ["autoTranslate", "auto_translate"], base.autoTranslate),
         base.autoTranslate
+      ),
+      translateInOneRequest: asBool(
+        pick(raw, ["translateInOneRequest", "translate_in_one_request"], base.translateInOneRequest),
+        base.translateInOneRequest
       ),
       debounce: asNumber(pick(raw, ["debounce"], base.debounce), base.debounce),
       hotKey: normalizeKeyCombo(pick(raw, ["hotKey", "hot_key"], base.hotKey), base.hotKey),
@@ -1062,6 +1067,7 @@
       "promptTarget",
       "promptPreview",
       "autoTranslateToggle",
+      "translateInOneRequestToggle",
       "debounceRow",
       "debounceRange",
       "debounceValue",
@@ -2030,6 +2036,7 @@
     setRange(els.contextRange, els.contextValue, draft.contextWindow, "thousands");
 
     els.autoTranslateToggle.checked = draft.autoTranslate;
+    els.translateInOneRequestToggle.checked = draft.translateInOneRequest;
     setRange(els.debounceRange, els.debounceValue, draft.debounce, "seconds");
     els.debounceRange.disabled = !draft.autoTranslate;
     els.keepHistoryToggle.checked = draft.keepHistory;
@@ -2568,6 +2575,7 @@
     draft.repetitionPenalty = Number(els.repetitionRange.value);
     draft.contextWindow = Number(els.contextRange.value);
     draft.autoTranslate = els.autoTranslateToggle.checked;
+    draft.translateInOneRequest = els.translateInOneRequestToggle.checked;
     draft.debounce = Number(els.debounceRange.value);
     draft.keepHistory = els.keepHistoryToggle.checked;
     draft.warmUpOnLaunch = els.warmUpToggle.checked;
@@ -4173,6 +4181,11 @@
       local.settingsDraft.autoTranslate = els.autoTranslateToggle.checked;
       els.debounceRange.disabled = !els.autoTranslateToggle.checked;
       els.debounceRow.setAttribute("aria-disabled", els.debounceRange.disabled ? "true" : "false");
+    });
+    els.translateInOneRequestToggle.addEventListener("change", () => {
+      if (local.settingsDraft) {
+        local.settingsDraft.translateInOneRequest = els.translateInOneRequestToggle.checked;
+      }
     });
     els.keepHistoryToggle.addEventListener("change", () => {
       if (local.settingsDraft) local.settingsDraft.keepHistory = els.keepHistoryToggle.checked;

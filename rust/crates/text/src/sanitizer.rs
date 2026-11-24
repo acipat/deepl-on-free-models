@@ -36,7 +36,7 @@ const RE_OPEN_CLOSE: &str = r"</｜[^>]*$";
 /// Python's `$` also matches just before a final newline; `(?:$|\n\z)` keeps
 /// that behaviour so a dangling token is removed even at the end of a stream.
 const RE_TRAILING_HY: &str = r"｜hy[^\s]*(?:$|\n\z)";
-const RE_TRAILING_BRACKET: &str = r"[<｜|]\s*$";
+const RE_TRAILING_BRACKET: &str = r"[<｜]\s*$";
 
 /// `Here is the translation:` / `Ось переклад тексту:` wrappers.
 const PREAMBLE_COLON: &str = concat!(

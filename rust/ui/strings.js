@@ -426,6 +426,7 @@
       "Translate selection": "Translate selection",
       "Translate selection (%@)": "Translate selection (%@)",
       "Translate text": "Translate text",
+      "Translate text in one request": "Translate text in one request",
       "Translate the following text into %@.": "Translate the following text into %@.",
       "Translate to": "Translate to",
       "Translated file": "Translated file",
